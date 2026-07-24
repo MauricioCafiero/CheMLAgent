@@ -82,7 +82,11 @@ previous sessions are not listed. The CheMeleon foundation cache at
 
 ## Install
 
+Clone from GitHub, then create the environment and sync:
+
 ```bash
+git clone https://github.com/MauricioCafiero/CheMLAgent.git
+cd CheMLAgent
 uv venv --python 3.14
 uv sync --all-extras      # base + mlp + chemprop + chembl
 # or pick extras:  uv sync --extra mlp --extra chemprop --extra chembl
