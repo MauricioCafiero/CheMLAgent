@@ -1,0 +1,76 @@
+# ---- Python ----
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.eggs/
+build/
+dist/
+develop-eggs/
+*.so
+
+# Byte-compiled / type-check caches
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.pyre/
+.pytype/
+
+# Coverage / profiling
+.coverage
+.coverage.*
+htmlcov/
+coverage.xml
+*.cover
+.hypothesis/
+profile_results/
+
+# ---- Virtual environments / uv ----
+.venv/
+venv/
+env/
+# NOTE: uv.lock is intentionally NOT ignored -- commit it for reproducible
+# installs.
+
+# ---- Jupyter / IPython ----
+.ipynb_checkpoints/
+*.ipynb_checkpoints
+.ipynb_profile/
+profile_default/
+ipython_config.py
+
+# ---- CheMLAgent run artifacts ----
+# Fitted models, featurizers, feature matrices, manifests, checkpoints, and the
+# downloaded CheMeleon foundation weights all live under runs/. They are
+# regenerable outputs, not source.
+runs/
+# recent_work/ holds the curated products (models, prepared CSVs, prediction
+# CSVs, manifests) copied out of runs/ as each stage completes -- also
+# regenerable outputs.
+recent_work/
+scratch/
+images/
+*.pkl
+*.pt
+*.ckpt
+*.npz
+
+# ---- Environment / secrets ----
+.env
+.env.*
+!.env.example
+*.local
+
+# ---- OS / editor ----
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+.idea/
+.vscode/
+*.swp
+*.swo
+*~

@@ -1,0 +1,6 @@
+neurons: 250
+input_dims: 54
+num_hidden_layers: 1
+classifier_flag: False
+num_classes: 1
+skip_connection: True

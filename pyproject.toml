@@ -1,0 +1,45 @@
+[project]
+name = "chemlagent"
+version = "0.1.0"
+description = "An agentic system for building and training ML models for chemistry, driven by Ollama tool calls."
+readme = "README.md"
+requires-python = ">=3.14,<3.15"
+dependencies = [
+    "numpy",
+    "pandas",
+    "scikit-learn",
+    "lightgbm",
+    "rdkit",
+    "scikit-fingerprints",
+    "ollama",
+    "rich",
+]
+
+[project.optional-dependencies]
+# PyTorch MLP model (pytorch_mlp.py). torch pinned to 2.12.1 to match the
+# working chemprop env (2.13 segfaults with chemprop/lightning on Apple MPS).
+mlp = ["torch==2.12.1", "matplotlib"]
+# Chemprop message-passing network (chemprop_model.py). Pinned to 2.2.3:
+# chemprop 2.3+ pulls in `cuik-molmaker-pin`, which has no macOS arm64 wheel.
+# 2.2.3 depends on `lightning` (the package that provides `lightning.pytorch`),
+# not the legacy `pytorch-lightning`. torch pinned to 2.12.1 (see mlp extra).
+chemprop = ["chemprop==2.2.3", "lightning==2.6.5", "torch==2.12.1"]
+# ChEMBL web client for the chembl_id fetch mode of prepare_chembl_csv.
+# Note: importing this package runs chembl_webresource_client/__init__ which
+# imports pkg_resources for __version__; with the setuptools<82 that torch
+# 2.12.1 forces here, pkg_resources is present and emits a one-time
+# deprecation UserWarning at startup. It is cosmetic (chembl still loads); we
+# keep the library to match the original implementation. See CLAUDE notes.
+chembl = ["chembl_webresource_client"]
+all = ["chemlagent[mlp]", "chemlagent[chemprop]", "chemlagent[chembl]"]
+dev = ["pytest"]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/chemlagent"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
