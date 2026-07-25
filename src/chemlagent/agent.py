@@ -31,6 +31,7 @@ from rich.table import Table
 from ollama import Client as ollama_client
 
 from chemlagent import tools as T
+from chemlagent.markdown_render import to_unicode_markdown
 
 console = Console(width=80)
 
@@ -453,7 +454,7 @@ def main(argv=None) -> int:
             continue
         elapsed = (time.time() - start) / 60
         console.print(f"\n[bold magenta]Response ({elapsed:.2f}m) >[/bold magenta]")
-        console.print(Markdown(content))
+        console.print(Markdown(to_unicode_markdown(content)))
         console.print()
 
 

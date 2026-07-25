@@ -45,8 +45,9 @@ trained model, inference `predictions.csv`, and `manifest.json`) are copied into
 intermediate scratch left in `runs/<run_id>/` (feature matrices, lightning
 checkpoints, the run dir itself), and prints the absolute paths of the
 **runs produced this session only** — runs already in `recent_work/` from
-previous sessions are not listed. The CheMeleon foundation cache at
-`runs/chemeleon_mp.pt` is kept.
+previous sessions are not listed. (The CheMeleon foundation path is
+currently inactive — see [CheMeleon foundation model](#chemeleon-foundation-model)
+— so no `chemeleon_mp.pt` cache is produced or moved.)
 
 ## What it can do
 
@@ -61,13 +62,39 @@ previous sessions are not listed. The CheMeleon foundation cache at
   `canonical_smi`, etc., and `IC50`/`pIC50`/`EC50`/`Ki`/`Kd`/`Lmax`/`λ_max`/
   `potency`/…). A log10 transform is autodetected when the target range is
   ≥ 1000 (e.g. nM IC50); inference inverts it automatically.
-- **Featurize** — fingerprints & descriptors via scikit-fingerprints: ECFP
-  (Morgan), Atom-Pair, Mordred, RDKit 2D, MACCS, PubChem, EState, functional
-  groups, RDKit path, plus 3D types (E3FP, Autocorr, MORSE, RDF) with
-  conformer generation. Murcko-scaffold train/test split.
-- **Train** — Random Forest, LightGBM, SVR (literature-tuned poly kernel), a
-  PyTorch wide-and-deep MLP, and a Chemprop message-passing neural network
-  (with optional CheMeleon foundation fine-tuning).
+- **Featurize** — fingerprints & descriptors via scikit-fingerprints, then a
+  Murcko-scaffold train/test split. 2D types run on the molecular graph; 3D
+  types generate conformers first. Pass `fp_type` (case-insensitive) to
+  `featurize_fingerprints`.
+
+  | `fp_type`        | family       | description                                            |
+  |------------------|--------------|--------------------------------------------------------|
+  | `ECFP`           | fingerprint  | Morgan/ECFP circular fingerprint (counted)             |
+  | `Atom_Pair`      | fingerprint  | topological atom-pair fingerprint                       |
+  | `MACCS`          | fingerprint  | 166-bit MACCS structural keys                           |
+  | `PubChem`        | fingerprint  | PubChem 881-bit fingerprint                            |
+  | `Functional_Groups` | fingerprint | functional-group presence bits                       |
+  | `RDKitFingerprint` | fingerprint | RDKit path fingerprint                                 |
+  | `Mordred`        | descriptor   | Mordred 2D/3D descriptor set (NaNs imputed downstream) |
+  | `RDKit_2D`       | descriptor   | RDKit's native ~217 continuous 2D descriptors           |
+  | `EState`         | descriptor   | 79 Kier–Hall electrotopological-state descriptors      |
+  | `E3FP`           | 3D fingerprint | 3D fingerprint from generated conformers             |
+  | `Autocorr`       | 3D descriptor | 3D autocorrelation descriptors                        |
+  | `MORSE`          | 3D descriptor | 3D Molecule Representation of Structures based on Electron diffraction |
+  | `RDF`            | 3D descriptor | radial distribution function descriptors              |
+  | *(molecular graph)* | graph     | not an `fp_type` — `train_chemprop` builds the graph directly from `data.csv` (SMILES → atom/bond graph via chemprop) |
+
+- **Train** — pick one model per run (same `run_id`). Fingerprint/descriptor
+  models take the featurized matrix; Chemprop reads `data.csv` directly and
+  trains on molecular graphs (no `featurize_fingerprints` call needed).
+
+  | tool              | model                          | input              | notes                                                   |
+  |-------------------|--------------------------------|--------------------|---------------------------------------------------------|
+  | `train_model`     | Random Forest                  | fingerprints/descriptors | `model_type=random_forest`, `n_estimators` tunable |
+  | `train_model`     | LightGBM                       | fingerprints/descriptors | `model_type=lightgbm`                               |
+  | `train_model`     | SVR                            | fingerprints/descriptors | `model_type=svr`, literature-tuned poly kernel     |
+  | `train_mlp`       | PyTorch wide-and-deep MLP      | fingerprints      | SGD/lr/weight-decay/batch tuned internally             |
+  | `train_chemprop`  | Chemprop MPNN                  | molecular graphs  | from-scratch MPNN only (CheMeleon foundation wired but inactive — see below) |
 - **Evaluate & infer** — metrics on the held-out split; predictions for new
   SMILES in original units.
 
@@ -158,12 +185,15 @@ rows; `limit=0` for all 5,751 generalizes better).
 Or, with a local CSV (no discovery / fetch):
 
 > Use the local CSV `621-azo.csv` (SMILES column `SMILES`, target column `Lmax`).
-> Prepare it with `run_id=azo`, train a chemprop model (`foundation=True`,
-> `epochs=15`), then predict λ_max for `c1ccc(/N=N/c2ccccc2)cc1` and
+> Prepare it with `run_id=azo`, train a chemprop model (`epochs=15`),
+> then predict λ_max for `c1ccc(/N=N/c2ccccc2)cc1` and
 > `C[N]1N=NC(=N1)N=NC2=CC=CC=C2`. Report test R², MAE, and the predictions in nm.
 
 On the azo dataset this yields ~R² 0.90, ~MAE 15 nm, and predicts azobenzene at
-~320 nm (matching its experimental π→π\* band).
+~320 nm (matching its experimental π→π\* band). *(These numbers were observed
+when the CheMeleon foundation path was still active; with the from-scratch
+MPNN that `train_chemprop` now uses, expect somewhat lower R² at the same
+epoch count.)*
 
 ## Tools
 
@@ -182,7 +212,7 @@ that doubles as the Ollama tool schema.
 | `run_inference`          | `smiles_list`                                             |
 | `train_mlp`              | `epochs` (default 2500, the tuned value)                  |
 | `run_inference_mlp`      | `smiles_list`                                             |
-| `train_chemprop`         | `epochs` (default 30), `foundation` (default `True`)      |
+| `train_chemprop`         | `epochs` (default 30), `batch_size`, `accelerator`       |
 | `run_inference_chemprop` | `smiles_list`                                             |
 
 Arguments are deliberately minimal to keep tool calls well-formed. Hyperparameters
@@ -191,11 +221,21 @@ MLP's SGD/lr/weight-decay/batch config, chemprop's Noam-style LR schedule).
 
 ### CheMeleon foundation model
 
-`train_chemprop(foundation=True)` initializes the message-passing block from the
+`train_chemprop` is wired to initialize its message-passing block from the
 [CheMeleon](https://arxiv.org/abs/2506.15792) pretrained weights (downloaded
-once to `runs/chemeleon_mp.pt`) and fine-tunes a fresh regression head —
-transfer learning that converges in a few epochs. Set `foundation=False` to
-train a from-scratch MPNN.
+once to `runs/chemeleon_mp.pt`) and fine-tune a fresh regression head —
+transfer learning that converges in a few epochs. **This path is currently
+inactive, however.** The pretrained message-passer is large (`d_h=2048`,
+`depth=6`, ~8.7M parameters) and blows up memory on this machine, so on
+2026-07-24 the `foundation` argument was removed from `train_chemprop` and it
+now trains only chemprop's standard from-scratch MPNN (`d_h=300`, `depth=3`,
+~30× smaller). The foundation loading machinery
+(`chemprop_model._load_foundation_mp`, the `from_foundation` / `foundation_path`
+constructor path, and the `_FOUNDATION_CACHE = runs/chemeleon_mp.pt` constant
+in `tools.py`) is preserved intact so the path can be re-enabled later by
+re-adding a `foundation` flag that branches to `chemprop_model(from_foundation="chemeleon", foundation_path=_FOUNDATION_CACHE)`. Until then, no
+`chemeleon_mp.pt` cache is downloaded or written, and the manifest's
+`is_foundation` is always `False`.
 
 ## Where input CSVs come from
 
@@ -280,3 +320,29 @@ synthetic data, so the tools are verifiable without hitting Ollama.
 - No grid search is exposed (per scope); pass explicit hyperparameters or rely
   on the tuned defaults.
 - `CLAUDE.md` holds the original project brief / agent instructions.
+
+## Acknowledgments
+
+CheMLAgent is a thin agentic layer on top of several excellent open-source
+projects; the real chemistry and ML heavy lifting is theirs:
+
+| package                                              | used for                                  |
+|------------------------------------------------------|-------------------------------------------|
+| [RDKit](https://www.rdkit.org/)                      | SMILES parsing, descriptors, Murcko scaffolds, conformer generation |
+| [scikit-fingerprints](https://github.com/dfpl/scikit-fingerprints) | the fingerprint/descriptor estimators behind `featurize_fingerprints` |
+| [scikit-learn](https://scikit-learn.org/)            | Random Forest, SVR, PCA, StandardScaler, metrics |
+| [LightGBM](https://lightgbm.readthedocs.io/)         | gradient-boosted trees model               |
+| [PyTorch](https://pytorch.org/)                      | the wide-and-deep MLP                     |
+| [Chemprop](https://chemprop.org/)                   | message-passing neural network for molecular graphs |
+| [Lightning](https://lightning.ai/)                  | Chemprop's training loop                   |
+| [CheMeleon](https://arxiv.org/abs/2506.15792)        | pretrained MPNN foundation weights (wired in `chemprop_model` but currently inactive in `train_chemprop` due to memory — see above) |
+| [ChEMBL](https://www.ebi.ac.uk/chembl/) + `chembl_webresource_client` | bioactivity data and the `chembl_id` fetch mode |
+| [Open Targets](https://www.opentargets.org/)        | disease → target associations (`search_targets`) |
+| [UniProt](https://www.uniprot.org/)                 | protein/gene → accession resolution (`search_uniprot`) |
+| [Ollama](https://ollama.com/)                       | chat model + tool-call dispatch           |
+| [Rich](https://rich.readthedocs.io/)                | terminal UI (banners, tables, Markdown rendering) |
+| [pandas](https://pandas.pydata.org/) / [NumPy](https://numpy.org/) | tabular I/O and array math       |
+| [uv](https://docs.astral.sh/uv/) / [pytest](https://docs.pytest.org/) | environment management / tests     |
+
+Data fetched via ChEMBL, Open Targets, and UniProt is governed by their
+respective licenses and terms of use.
