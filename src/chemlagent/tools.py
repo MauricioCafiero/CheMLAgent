@@ -49,6 +49,20 @@ from chemlagent.models import (
 )
 from chemlagent.products import publish_products
 
+# Hyperparameter-search dependencies. Imported here (not just in models.py) so
+# grid_search can build the same estimators train_model uses and wrap them in
+# GridSearchCV. n_jobs is pinned to 1 everywhere to avoid forking workers, which
+# re-triggers the libomp double-load segfault (see memory: torch-before-lightgbm).
+from sklearn.ensemble import RandomForestRegressor
+from sklearn.svm import SVR
+from sklearn.pipeline import Pipeline
+from sklearn.preprocessing import StandardScaler
+from sklearn.model_selection import GridSearchCV
+from sklearn.metrics import r2_score
+from lightgbm import LGBMRegressor
+
+from chemlagent.descriptor_cleaning import impute_only_cleaner
+
 __all__ = [
     "search_uniprot",
     "list_bioactives",
@@ -56,6 +70,7 @@ __all__ = [
     "prepare_chembl_csv",
     "featurize_fingerprints",
     "train_model",
+    "grid_search",
     "evaluate_model",
     "run_inference",
     "train_mlp",
@@ -466,6 +481,250 @@ def train_model(
         "model_path": model_path,
         "r2": float(r2),
         "r2_train": float(r2_train),
+        "manifest_path": manifest_path,
+    }
+
+
+# --- hyperparameter search ------------------------------------------------
+#
+# grid_search tunes ONE of the three sklearn models (random_forest, lightgbm,
+# svr) over a small user-supplied grid, then saves the best model exactly as
+# train_model does (model.pkl + manifest), so evaluate_model / run_inference
+# work unchanged on the result. Search uses k-fold CV on the TRAIN split only
+# (the held-out test split in features.npz is never seen during tuning), then
+# refits the best params on the full train and reports test r2/mae.
+
+# Cap the search cost so a tool call can't fan out into hundreds of fits:
+# at most 3 values per hyperparameter and at most 6 combinations total (so a
+# 3x3=9 grid is rejected). With cv=5 that's <= 30 fits, which is seconds for
+# RF/LightGBM/SVR single-threaded.
+_GRID_MAX_VALUES_PER_PARAM = 3
+_GRID_MAX_COMBINATIONS = 6
+_GRID_CV_FOLDS = 5
+
+# Tunable hyperparameters exposed per model type. Anything outside this set is
+# rejected, so the agent can't pass unsupported or mis-spelled knobs. The SVR
+# poly-kernel shape (degree=2, coef0=7) is fixed at the literature value and
+# NOT searched; only C / gamma / epsilon are tunable.
+_GRID_ALLOWED_PARAMS: dict[str, set[str]] = {
+    "random_forest": {"n_estimators", "max_depth", "min_samples_leaf",
+                      "max_features"},
+    "lightgbm": {"n_estimators", "num_leaves", "learning_rate",
+                 "min_child_samples"},
+    "svr": {"C", "gamma", "epsilon"},
+}
+
+# model_type aliases -> canonical name (mirrors train_model's acceptance set).
+_GRID_ALIASES = {
+    "random_forest": "random_forest", "rf": "random_forest",
+    "randomforest": "random_forest",
+    "lightgbm": "lightgbm", "lgbm": "lightgbm",
+    "svr": "svr",
+}
+
+
+def _validate_param_grid(model_type: str,
+                         param_grid: dict[str, list]) -> tuple[dict[str, list], int]:
+    """Coerce + validate a user-supplied param grid for the given model type.
+
+    Returns (clean_grid, n_combinations). Raises ValueError on any violation:
+    unknown param, fewer than 2 values, more than _GRID_MAX_VALUES_PER_PARAM
+    values, or more than _GRID_MAX_COMBINATIONS total combinations.
+    """
+    if not isinstance(param_grid, dict) or not param_grid:
+        raise ValueError(
+            "param_grid must be a non-empty dict of hyperparameter -> list of "
+            "values, e.g. {'n_estimators': [100, 200, 400]}.")
+    allowed = _GRID_ALLOWED_PARAMS[model_type]
+    unknown = set(param_grid) - allowed
+    if unknown:
+        raise ValueError(
+            f"Unknown hyperparameter(s) for {model_type!r}: {sorted(unknown)}. "
+            f"Allowed: {sorted(allowed)}.")
+    clean: dict[str, list] = {}
+    n_combos = 1
+    for key, vals in param_grid.items():
+        values = list(vals)
+        # max_depth is the only param where None ("unlimited") is meaningful.
+        # If the model emitted the literal strings "None"/"null" (valid JSON,
+        # unlike bare Python None which Ollama drops before we're reached),
+        # coerce them to None so sklearn gets what it expects.
+        if key == "max_depth":
+            values = [None if (isinstance(v, str) and v.lower() in ("none", "null"))
+                      else v for v in values]
+        if len(values) < 2:
+            raise ValueError(
+                f"{key}: a grid search needs at least 2 values to compare, "
+                f"got {len(values)}.")
+        if len(values) > _GRID_MAX_VALUES_PER_PARAM:
+            raise ValueError(
+                f"{key}: at most {_GRID_MAX_VALUES_PER_PARAM} values per "
+                f"hyperparameter, got {len(values)}.")
+        n_combos *= len(values)
+        clean[key] = values
+    if n_combos > _GRID_MAX_COMBINATIONS:
+        raise ValueError(
+            f"param_grid expands to {n_combos} combinations; the limit is "
+            f"{_GRID_MAX_COMBINATIONS} total. Drop a value or a hyperparameter.")
+    return clean, n_combos
+
+
+def _build_search_estimator(model_type: str,
+                            user_grid: dict[str, list]) -> tuple[object, dict[str, list]]:
+    """Build the base estimator + sklearn-form grid for one model type.
+
+    RF/LightGBM get the bare regressor (param names match the user grid
+    directly). SVR gets the same clean -> scale -> SVR(poly, degree=2, coef0=7)
+    Pipeline as models.svr_regression, with user params namespaced as 'svr__C'
+    etc. so GridSearchCV routes them to the SVR step.
+    """
+    if model_type == "random_forest":
+        est = RandomForestRegressor(random_state=42, n_jobs=1)
+        return est, dict(user_grid)
+    if model_type == "lightgbm":
+        est = LGBMRegressor(random_state=42, n_jobs=1, verbose=-1)
+        return est, dict(user_grid)
+    # svr
+    est = Pipeline([
+        ("clean", impute_only_cleaner()),
+        ("scale", StandardScaler()),
+        ("svr", SVR(kernel="poly", degree=2, coef0=7)),
+    ])
+    grid = {f"svr__{k}": v for k, v in user_grid.items()}
+    return est, grid
+
+
+def grid_search(
+    run_id: str,
+    model_type: str,
+    param_grid: dict[str, list],
+) -> dict:
+    """Grid-search hyperparameters for a model and save the best fit.
+
+    Runs k-fold (5-fold) cross-validated grid search over a SMALL
+    hyperparameter grid on the TRAIN split only (the held-out test split in
+    features.npz is never seen during tuning), refits the best combination on
+    the full train set, evaluates on the held-out test split, and saves the
+    result exactly like train_model (model.pkl + manifest update) so
+    evaluate_model / run_inference work unchanged on the result.
+
+    The grid is capped to keep tool calls bounded: at most 3 values per
+    hyperparameter and at most 6 total combinations (so a 3x3=9 grid is
+    rejected with an error). With 5-fold CV that is at most 30 fits, which is
+    seconds single-threaded. Search runs single-threaded (n_jobs=1) to avoid
+    forking workers, which would re-trigger the Apple-Silicon libomp
+    double-load segfault (see train_model's note on lightgbm n_jobs).
+
+    Only one model type is searched per call. The tunable hyperparameters are
+    whitelisted per model type; unknown ones are rejected:
+
+      - random_forest: n_estimators, max_depth, min_samples_leaf, max_features
+      - lightgbm: n_estimators, num_leaves, learning_rate, min_child_samples
+      - svr: C, gamma, epsilon (the poly kernel's degree=2 / coef0=7 are fixed
+        at the literature value and are NOT searched)
+
+    Use the SAME run_id as the preceding featurize_fingerprints call. This
+    overwrites any model.pkl already saved for that run.
+
+    Args:
+        run_id: Pipeline run identifier; reads features.npz, writes
+            model.pkl and updates manifest.json.
+        model_type: One of 'random_forest' (aliases 'rf', 'randomforest'),
+            'lightgbm' (alias 'lgbm'), or 'svr'.
+        param_grid: dict of hyperparameter name -> list of values to search.
+            Emit this as a JSON object whose values are JSON arrays. Use JSON
+            null (never the Python literal None) for "unlimited", e.g.
+            {"n_estimators": [100, 300], "max_depth": [null, 20, 40]}.
+            Values may be ints, floats, strings, or null (max_depth=null means
+            unlimited depth; only max_depth accepts null). Writing Python None
+            in the tool call is invalid JSON and the call will be dropped.
+            At most 3 values per key and 6 combinations total.
+
+    Returns:
+        dict with keys: run_id, model_type, best_params (dict, user-facing
+        names), best_cv_r2 (float, mean CV r2 of the best combo), r2, r2_train,
+        model_path, manifest_path.
+    """
+    print("Grid search tool")
+    print("=" * 55)
+
+    canonical = _GRID_ALIASES.get(model_type.lower())
+    if canonical is None:
+        raise ValueError(
+            f"Unknown model_type {model_type!r}. Use 'random_forest', "
+            f"'lightgbm', or 'svr'.")
+    model_type = canonical
+
+    user_grid, n_combos = _validate_param_grid(model_type, param_grid)
+    estimator, sk_grid = _build_search_estimator(model_type, user_grid)
+
+    feats = np.load(os.path.join(run_dir(run_id), _FEATURES))
+    X_train, X_test = feats["X_train"], feats["X_test"]
+    y_train, y_test = feats["y_train"], feats["y_test"]
+
+    # Shrink CV folds for small train sets so each fold still has enough rows.
+    n_train = int(np.asarray(y_train).reshape(-1).shape[0])
+    cv = _GRID_CV_FOLDS
+    while cv > 2 and n_train // cv < 5:
+        cv -= 1
+
+    print(f"Searching {model_type} over {n_combos} combination(s) "
+          f"({cv}-fold CV, n_jobs=1).")
+    gs = GridSearchCV(
+        estimator, sk_grid, cv=cv, scoring="r2",
+        n_jobs=1, refit=True, error_score="raise",
+    )
+    gs.fit(X_train, y_train)
+
+    best = gs.best_estimator_          # refit on full X_train (refit=True)
+    best_cv = float(gs.best_score_)
+
+    # best_params_ uses sklearn namespaced names for SVR ('svr__C'); strip the
+    # prefix so the return value uses the user-facing hyperparameter names.
+    best_params = {
+        (k.split("__", 1)[1] if k.startswith("svr__") else k): v
+        for k, v in gs.best_params_.items()
+    }
+
+    y_pred = best.predict(X_test)
+    y_train_pred = best.predict(X_train)
+    r2 = float(r2_score(y_test, y_pred))
+    r2_train = float(r2_score(y_train, y_train_pred))
+
+    if print_flag:
+        print(f"CV results (sorted by mean r2):")
+        rows = sorted(gs.cv_results_["mean_test_score"], reverse=True)
+        for rank, mean in enumerate(rows, 1):
+            print(f"  {rank}. mean_cv_r2={mean:.4f}")
+        print(f"Best params: {best_params}  (best_cv_r2={best_cv:.4f})")
+
+    model_path = os.path.join(run_dir(run_id), _MODEL)
+    with open(model_path, "wb") as fh:
+        pickle.dump(best, fh)
+
+    manifest = _read_manifest(run_id)
+    manifest.update({
+        "model_type": model_type,
+        "model_path": model_path,
+        "r2": r2,
+        "r2_train": r2_train,
+        "grid_search": True,
+        "best_params": {k: (None if v is None else v) for k, v in best_params.items()},
+        "best_cv_r2": best_cv,
+        "n_grid_combinations": n_combos,
+        "cv_folds": cv,
+    })
+    manifest_path = _write_manifest(run_id, manifest)
+    publish_products(run_id, run_dir(run_id), _MODEL, _MANIFEST)
+
+    return {
+        "run_id": run_id,
+        "model_type": model_type,
+        "best_params": best_params,
+        "best_cv_r2": best_cv,
+        "r2": r2,
+        "r2_train": r2_train,
+        "model_path": model_path,
         "manifest_path": manifest_path,
     }
 

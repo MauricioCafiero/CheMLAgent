@@ -23,7 +23,10 @@ infers each tool's JSON schema from the function signature + docstring, so the
 prepare_chembl_csv  ──►  featurize_fingerprints  ──►  train_model   ──►  evaluate_model
   (CSV / ChEMBL ID)        (fingerprints /           (RF / LightGBM /      (held-out test)
   ← or input_csv directly   descriptors)              SVR)
-                                                   ──►  train_mlp          ──►  run_inference(_mlp/_chemprop)
+                                                   ──►  grid_search        ──►  run_inference(_mlp/_chemprop)
+                                                       (5-fold CV over a          (small hyperparameter grid,
+                                                        same run_id)               refits + saves best)
+                                                   ──►  train_mlp
                                                    ──►  train_chemprop
                                                         (MPNN on mol graphs)
 ```
@@ -93,6 +96,7 @@ currently inactive — see [CheMeleon foundation model](#chemeleon-foundation-mo
   | `train_model`     | Random Forest                  | fingerprints/descriptors | `model_type=random_forest`, `n_estimators` tunable |
   | `train_model`     | LightGBM                       | fingerprints/descriptors | `model_type=lightgbm`                               |
   | `train_model`     | SVR                            | fingerprints/descriptors | `model_type=svr`, literature-tuned poly kernel     |
+  | `grid_search`     | RF / LightGBM / SVR            | fingerprints/descriptors | 5-fold CV over a small grid; refits + saves best (see below) |
   | `train_mlp`       | PyTorch wide-and-deep MLP      | fingerprints      | SGD/lr/weight-decay/batch tuned internally             |
   | `train_chemprop`  | Chemprop MPNN                  | molecular graphs  | from-scratch MPNN only (CheMeleon foundation wired but inactive — see below) |
 - **Evaluate & infer** — metrics on the held-out split; predictions for new
@@ -208,6 +212,7 @@ that doubles as the Ollama tool schema.
 | `prepare_chembl_csv`     | `chembl_id` *or* `input_csv`; `limit`, `units`, `activity_type` |
 | `featurize_fingerprints` | `fp_type` (default `ECFP`), `test_size`                   |
 | `train_model`            | `model_type` (`random_forest`/`lightgbm`/`svr`), `n_estimators` |
+| `grid_search`            | `model_type`, `param_grid` (dict; capped at 3 values/param, 6 combos total) |
 | `evaluate_model`         | —                                                         |
 | `run_inference`          | `smiles_list`                                             |
 | `train_mlp`              | `epochs` (default 2500, the tuned value)                  |
@@ -218,6 +223,18 @@ that doubles as the Ollama tool schema.
 Arguments are deliberately minimal to keep tool calls well-formed. Hyperparameters
 that aren't exposed use tuned internal defaults (e.g. the SVR poly kernel, the
 MLP's SGD/lr/weight-decay/batch config, chemprop's Noam-style LR schedule).
+
+`grid_search` is the exception: it exposes a bounded hyperparameter grid. The
+search runs 5-fold CV on the **train split only** (the held-out test split is
+never seen during tuning), refits the best combination on the full train set,
+and saves the result like `train_model` so `evaluate_model`/`run_inference`
+work unchanged. The grid is capped at 3 values per hyperparameter and 6
+combinations total (a 3×3=9 grid is rejected), runs single-threaded to avoid
+the Apple-Silicon libomp double-load segfault, and only whitelisted params are
+accepted: `random_forest` {n_estimators, max_depth, min_samples_leaf,
+max_features}, `lightgbm` {n_estimators, num_leaves, learning_rate,
+min_child_samples}, `svr` {C, gamma, epsilon} (the poly kernel's degree=2 /
+coef0=7 stay fixed). MLP and chemprop are not yet supported by `grid_search`.
 
 ### CheMeleon foundation model
 

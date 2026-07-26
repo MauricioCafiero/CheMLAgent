@@ -50,6 +50,9 @@ runs/
 recent_work/
 scratch/
 images/
+# PyTorch Lightning writes a lightning_logs/ version dir on every train run;
+# regenerable training output, not source.
+lightning_logs/
 *.pkl
 *.pt
 *.ckpt

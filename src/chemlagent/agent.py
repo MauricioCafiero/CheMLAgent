@@ -56,6 +56,7 @@ TOOLS = [
     T.prepare_chembl_csv,
     T.featurize_fingerprints,
     T.train_model,
+    T.grid_search,
     T.evaluate_model,
     T.run_inference,
     T.train_mlp,
@@ -101,6 +102,13 @@ train_model / train_mlp. Use the SAME run_id.
 directly; trains a small from-scratch MPNN). No \
 featurize_fingerprints call needed for chemprop.
    Report the returned r2 / mae.
+   - grid_search — optional: 5-fold CV grid search over a SMALL grid for ONE of \
+random_forest / lightgbm / svr (caps: 3 values per hyperparameter, 6 combos \
+total), then saves the best fit like train_model. Tunable params: \
+random_forest {{n_estimators, max_depth, min_samples_leaf, max_features}}, \
+lightgbm {{n_estimators, num_leaves, learning_rate, min_child_samples}}, \
+svr {{C, gamma, epsilon}}. Use it when the user asks to tune or optimize, or \
+when a plain train_model r2 is poor; otherwise train_model is enough.
 4. evaluate_model — evaluate the saved fingerprint model on the held-out test \
 split (not used for chemprop, which reports test metrics at train time).
 5. run_inference / run_inference_mlp / run_inference_chemprop — predict the \
