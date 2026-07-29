@@ -35,8 +35,11 @@ import pandas as pd
 
 from chemlagent.products import RECENT_WORK_DIR, recent_work_path
 
-# Filenames per model type, mirroring what the tools save + relocate.
-_SKLEAN_FILES = ("model.pkl", "featurizer.pkl")
+# Filenames per model type, mirroring what the tools save + relocate. The
+# sklearn models each write model_<type>.pkl (a run can hold several); the
+# active model's exact path is read from the manifest's model_path field, with
+# model.pkl as a fallback for older runs that predate per-type files.
+_SKLEARN_FALLBACK = "model.pkl"
 _MLP_FILES = ("mlp_model.pt", "mlp_prep.npz", "featurizer.pkl")
 _CHEMPROP_FILES = ("chemprop_model.pt",)
 
@@ -45,8 +48,9 @@ def list_available_models(root: str | None = None) -> list[dict]:
     """Inventory the saved runs under ``recent_work/``.
 
     Returns one dict per run (sorted by run_id) with: run_id, model_type,
-    is_foundation, fp_type, r2, mae, n_train, n_test, log_transformed, and the
-    absolute directory path. Runs without a manifest are skipped.
+    models (list of all types trained on the run), is_foundation, fp_type, r2,
+    mae, n_train, n_test, log_transformed, and the absolute directory path.
+    Runs without a manifest are skipped.
     """
     base = recent_work_path() if root is None else root
     out: list[dict] = []
@@ -65,6 +69,7 @@ def list_available_models(root: str | None = None) -> list[dict]:
         out.append({
             "run_id": run_id,
             "model_type": m.get("model_type"),
+            "models": sorted(m.get("models", {}).keys()),
             "is_foundation": m.get("is_foundation"),
             "fp_type": m.get("fp_type"),
             "r2": m.get("r2"),
@@ -94,8 +99,14 @@ class LoadedModel:
     arch: dict = field(default_factory=dict)
 
     @classmethod
-    def load(cls, run_id: str, root: str | None = None) -> "LoadedModel":
-        """Load a saved run from ``recent_work/<run_id>/`` by its model type."""
+    def load(cls, run_id: str, model_type: str | None = None,
+             root: str | None = None) -> "LoadedModel":
+        """Load a saved run from ``recent_work/<run_id>/`` by model type.
+
+        ``model_type`` picks which trained model to load when a run holds
+        several (one per type); if omitted, the run's active
+        (most-recently-trained) model is loaded.
+        """
         rd = os.path.join(recent_work_path() if root is None else root, run_id)
         if not os.path.isdir(rd):
             raise FileNotFoundError(
@@ -103,7 +114,8 @@ class LoadedModel:
                 f"Use list_available_models() to see what's available.")
         with open(os.path.join(rd, "manifest.json")) as fh:
             manifest = json.load(fh)
-        model_type = manifest.get("model_type")
+        if model_type is None:
+            model_type = manifest.get("model_type")
         if not model_type:
             raise ValueError(f"Run {run_id!r} has no trained model in its manifest.")
         log_transformed = bool(manifest.get("log_transformed", False))
@@ -111,10 +123,18 @@ class LoadedModel:
         self = cls(run_id=run_id, model_type=model_type,
                    log_transformed=log_transformed, run_dir=rd)
 
+        # Resolve the requested model's record: the per-type entry if present
+        # (so a non-active model on a multi-model run loads its OWN file), else
+        # the flat manifest (active model / older runs).
+        record = manifest.get("models", {}).get(model_type, manifest)
+
         if model_type in ("random_forest", "lightgbm", "svr"):
-            self._load_sklearn(rd)
+            sklearn_file = os.path.basename(
+                record.get("model_path") or manifest.get("model_path")
+                or _SKLEARN_FALLBACK)
+            self._load_sklearn(rd, sklearn_file)
         elif model_type == "mlp":
-            self.arch = manifest.get("mlp_arch", {})
+            self.arch = record.get("mlp_arch", manifest.get("mlp_arch", {}))
             self._load_mlp(rd)
         elif model_type == "chemprop":
             self._load_chemprop(rd)
@@ -124,8 +144,8 @@ class LoadedModel:
 
     # -- per-type loaders ----------------------------------------------------
 
-    def _load_sklearn(self, rd: str) -> None:
-        with open(os.path.join(rd, "model.pkl"), "rb") as fh:
+    def _load_sklearn(self, rd: str, sklearn_file: str) -> None:
+        with open(os.path.join(rd, sklearn_file), "rb") as fh:
             self.model = pickle.load(fh)
         with open(os.path.join(rd, "featurizer.pkl"), "rb") as fh:
             self.featurizer = pickle.load(fh)

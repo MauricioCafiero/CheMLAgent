@@ -82,6 +82,8 @@ __all__ = [
 _MANIFEST = "manifest.json"
 _FEATURES = "features.npz"
 _FEATURIZER = "featurizer.pkl"
+# Legacy single-model filename from older runs (pre per-type files). Kept for
+# reference/back-compat; train_model / grid_search now write model_<type>.pkl.
 _MODEL = "model.pkl"
 
 # Broadcast print flag: the agent sets chemlagent.tools.print_flag = <args.print>
@@ -106,6 +108,58 @@ def _write_manifest(run_id: str, manifest: dict) -> str:
 def _read_manifest(run_id: str) -> dict:
     with open(_manifest_path(run_id)) as fh:
         return json.load(fh)
+
+
+# model_type aliases -> canonical name, across every tool that takes a
+# model_type (train_model, grid_search, evaluate_model, run_inference). Keeps
+# spelling tolerant ("rf", "lgbm", "randomforest") while the manifest always
+# stores the canonical key.
+_MODEL_ALIASES = {
+    "random_forest": "random_forest", "rf": "random_forest",
+    "randomforest": "random_forest",
+    "lightgbm": "lightgbm", "lgbm": "lightgbm",
+    "svr": "svr",
+    "mlp": "mlp",
+    "chemprop": "chemprop",
+}
+
+
+def _canonical_model_type(model_type: str) -> str:
+    """Normalize a model_type spelling to its canonical name, or raise."""
+    key = model_type.lower()
+    canonical = _MODEL_ALIASES.get(key)
+    if canonical is None:
+        raise ValueError(
+            f"Unknown model_type {model_type!r}. Use 'random_forest', "
+            f"'lightgbm', 'svr', 'mlp', or 'chemprop'.")
+    return canonical
+
+
+def _record_model(run_id: str, model_type: str, model_path: str,
+                  **fields) -> str:
+    """Record a trained model in the run manifest and return the manifest path.
+
+    Writes TWO things so multiple models trained on the same run stay
+    independently reachable:
+
+      * the flat "active model" fields (``model_type`` / ``model_path`` plus the
+        given metrics) -- this is the most-recently-trained model and stays
+        back-compatible with runs / callers that expect a single model per run;
+      * a per-type entry under ``manifest["models"][model_type]`` holding the
+        same ``model_path`` + metrics, so ``evaluate_model(run_id, model_type=...)``
+        can pick any model trained on the run, not just the active one.
+
+    Each model type writes its own file (e.g. ``model_lightgbm.pkl``,
+    ``mlp_model.pt``), so training a second model never overwrites a first.
+    """
+    manifest = _read_manifest(run_id) if os.path.exists(
+        _manifest_path(run_id)) else {}
+    manifest["model_type"] = model_type
+    manifest["model_path"] = model_path
+    manifest.update(fields)
+    models = manifest.setdefault("models", {})
+    models[model_type] = {"model_path": model_path, **fields}
+    return _write_manifest(run_id, manifest)
 
 
 def _write_predictions_csv(run_id: str, smiles_list, preds) -> str:
@@ -418,9 +472,9 @@ def train_model(
     """Train a regression model on the featurized dataset and save it.
 
     Loads runs/<run_id>/features.npz, trains the requested model, pickles it to
-    runs/<run_id>/model.pkl, and records metrics + model type in the run
-    manifest. The saved model is a sklearn estimator (or Pipeline for SVR)
-    whose .predict takes the same fingerprint features.
+    runs/<run_id>/model_<model_type>.pkl, and records metrics + model type in
+    the run manifest. The saved model is a sklearn estimator (or Pipeline for
+    SVR) whose .predict takes the same fingerprint features.
 
     SVR uses literature-tuned poly-kernel hyperparameters internally (the ones
     models.svr_regression defaults to); lightgbm uses a single OpenMP thread to
@@ -428,8 +482,8 @@ def train_model(
     models) the estimator count are exposed, to keep tool calls simple.
 
     Args:
-        run_id: Pipeline run identifier; reads features.npz, writes model.pkl
-            and updates manifest.json.
+        run_id: Pipeline run identifier; reads features.npz, writes
+            model_<model_type>.pkl and updates manifest.json.
         model_type: One of 'random_forest', 'lightgbm', or 'svr'.
         n_estimators: Number of trees/estimators for random_forest and
             lightgbm (default 100). Ignored for svr.
@@ -444,12 +498,12 @@ def train_model(
     X_train, X_test = feats["X_train"], feats["X_test"]
     y_train, y_test = feats["y_train"], feats["y_test"]
 
-    model_type = model_type.lower()
-    if model_type in ("random_forest", "rf", "randomforest"):
+    model_type = _canonical_model_type(model_type)
+    if model_type == "random_forest":
         r2, r2_train, model = random_forest_regression(
             X_train, y_train, X_test, y_test,
             n_estimators=n_estimators, random_state=42)
-    elif model_type in ("lightgbm", "lgbm"):
+    elif model_type == "lightgbm":
         r2, r2_train, model = lightgbm_regression(
             X_train, y_train, X_test, y_test,
             n_estimators=n_estimators, random_state=42, n_jobs=1)
@@ -461,19 +515,18 @@ def train_model(
             f"Unknown model_type {model_type!r}. Use 'random_forest', "
             f"'lightgbm', or 'svr'.")
 
-    model_path = os.path.join(run_dir(run_id), _MODEL)
+    # Per-type filename so training a second sklearn model on the same run
+    # never overwrites a first (e.g. train random_forest then lightgbm and both
+    # survive for evaluate_model(run_id, model_type=...)).
+    model_path = os.path.join(run_dir(run_id), f"model_{model_type}.pkl")
     with open(model_path, "wb") as fh:
         pickle.dump(model, fh)
 
-    manifest = _read_manifest(run_id)
-    manifest.update({
-        "model_type": model_type,
-        "model_path": model_path,
-        "r2": float(r2),
-        "r2_train": float(r2_train),
-    })
-    manifest_path = _write_manifest(run_id, manifest)
-    publish_products(run_id, run_dir(run_id), _MODEL, _MANIFEST)
+    manifest_path = _record_model(
+        run_id, model_type, model_path,
+        r2=float(r2), r2_train=float(r2_train))
+    publish_products(run_id, run_dir(run_id), os.path.basename(model_path),
+                     _MANIFEST)
 
     return {
         "run_id": run_id,
@@ -489,7 +542,7 @@ def train_model(
 #
 # grid_search tunes ONE of the three sklearn models (random_forest, lightgbm,
 # svr) over a small user-supplied grid, then saves the best model exactly as
-# train_model does (model.pkl + manifest), so evaluate_model / run_inference
+# train_model does (model_<type>.pkl + manifest), so evaluate_model / run_inference
 # work unchanged on the result. Search uses k-fold CV on the TRAIN split only
 # (the held-out test split in features.npz is never seen during tuning), then
 # refits the best params on the full train and reports test r2/mae.
@@ -605,8 +658,8 @@ def grid_search(
     hyperparameter grid on the TRAIN split only (the held-out test split in
     features.npz is never seen during tuning), refits the best combination on
     the full train set, evaluates on the held-out test split, and saves the
-    result exactly like train_model (model.pkl + manifest update) so
-    evaluate_model / run_inference work unchanged on the result.
+    result exactly like train_model (model_<model_type>.pkl + manifest
+    update) so evaluate_model / run_inference work unchanged on the result.
 
     The grid is capped to keep tool calls bounded: at most 3 values per
     hyperparameter and at most 6 total combinations (so a 3x3=9 grid is
@@ -624,11 +677,13 @@ def grid_search(
         at the literature value and are NOT searched)
 
     Use the SAME run_id as the preceding featurize_fingerprints call. This
-    overwrites any model.pkl already saved for that run.
+    saves model_<model_type>.pkl (per-type, so it does not overwrite a
+    different model type already trained on the run) and records it in the
+    manifest, making it the run's active model.
 
     Args:
         run_id: Pipeline run identifier; reads features.npz, writes
-            model.pkl and updates manifest.json.
+            model_<model_type>.pkl and updates manifest.json.
         model_type: One of 'random_forest' (aliases 'rf', 'randomforest'),
             'lightgbm' (alias 'lgbm'), or 'svr'.
         param_grid: dict of hyperparameter name -> list of values to search.
@@ -698,24 +753,20 @@ def grid_search(
             print(f"  {rank}. mean_cv_r2={mean:.4f}")
         print(f"Best params: {best_params}  (best_cv_r2={best_cv:.4f})")
 
-    model_path = os.path.join(run_dir(run_id), _MODEL)
+    model_path = os.path.join(run_dir(run_id), f"model_{model_type}.pkl")
     with open(model_path, "wb") as fh:
         pickle.dump(best, fh)
 
-    manifest = _read_manifest(run_id)
-    manifest.update({
-        "model_type": model_type,
-        "model_path": model_path,
-        "r2": r2,
-        "r2_train": r2_train,
-        "grid_search": True,
-        "best_params": {k: (None if v is None else v) for k, v in best_params.items()},
-        "best_cv_r2": best_cv,
-        "n_grid_combinations": n_combos,
-        "cv_folds": cv,
-    })
-    manifest_path = _write_manifest(run_id, manifest)
-    publish_products(run_id, run_dir(run_id), _MODEL, _MANIFEST)
+    manifest_path = _record_model(
+        run_id, model_type, model_path,
+        r2=r2, r2_train=r2_train,
+        grid_search=True,
+        best_params={k: (None if v is None else v) for k, v in best_params.items()},
+        best_cv_r2=best_cv,
+        n_grid_combinations=n_combos,
+        cv_folds=cv)
+    publish_products(run_id, run_dir(run_id), os.path.basename(model_path),
+                     _MANIFEST)
 
     return {
         "run_id": run_id,
@@ -729,35 +780,100 @@ def grid_search(
     }
 
 
-def evaluate_model(run_id: str) -> dict:
-    """Evaluate the saved model on the held-out test split.
+def evaluate_model(run_id: str, model_type: str | None = None) -> dict:
+    """Evaluate a saved model on the held-out test split.
 
-    Loads runs/<run_id>/model.pkl and features.npz, predicts on the test
-    features, and returns regression metrics plus per-molecule predictions.
+    Loads a saved model for the run and predicts on the held-out test split in
+    features.npz, returning regression metrics plus per-molecule predictions.
+    A run can hold several trained models (one per type, each in its own file);
+    by default the run's active (most-recently-trained) model is evaluated, or
+    pass ``model_type`` to evaluate a specific one -- e.g. after training both
+    a LightGBM model and an MLP on the same run, call
+    ``evaluate_model(run_id, "lightgbm")`` and ``evaluate_model(run_id, "mlp")``
+    to compare them side by side without retraining either.
+
+    Dispatches on the model type:
+
+      - random_forest / lightgbm / svr: unpickle the model's
+        runs/<run_id>/model_<type>.pkl and call .predict on the raw test
+        features (the sklearn path).
+      - mlp: load the torch state_dict (mlp_model.pt) + the saved train-time
+        preprocessing stats (mlp_prep.npz), apply that SAME preprocessing to
+        the raw test features, and run the MLP forward pass. NB: the test
+        features in features.npz are RAW (un-preprocessed) -- train_mlp
+        applies cleaning/standardization/PCA internally and only stores the
+        r2 in the manifest, so to re-evaluate we must replay that transform
+        from the saved stats (mirrors predict_single_value's prep block).
+      - chemprop: the held-out test metrics (r2/mae) are computed during
+        train_chemprop via a Murcko scaffold split and stored in the
+        manifest; they are returned as-is. Per-molecule test predictions are
+        not stored, so predictions/truths are empty for this type -- use
+        run_inference_chemprop for new molecules.
 
     Args:
-        run_id: Pipeline run identifier; reads model.pkl and features.npz.
+        run_id: Pipeline run identifier; reads model_<type>.pkl / mlp_model.pt
+            and features.npz (sklearn/mlp), or manifest.json (chemprop).
+        model_type: Optional. Which trained model to evaluate: 'random_forest'
+            (aliases 'rf', 'randomforest'), 'lightgbm' (alias 'lgbm'), 'svr',
+            'mlp', or 'chemprop'. If omitted, evaluates the run's active
+            (most-recently-trained) model. Raises a helpful error naming the
+            available types if the requested one was never trained on the run.
 
     Returns:
-        dict with keys: run_id, r2, mae, n_test, predictions (list[float]),
-        truths (list[float]).
+        dict with keys: run_id, model_type, r2, mae, n_test, predictions
+        (list[float], empty for chemprop), truths (list[float], empty for
+        chemprop).
     """
     print("Evaluate model tool")
     print("=" * 55)
     from sklearn.metrics import r2_score, mean_absolute_error
 
     manifest = _read_manifest(run_id)
-    model_path = manifest["model_path"]
-    with open(model_path, "rb") as fh:
-        model = pickle.load(fh)
+    if model_type is None:
+        model_type = manifest.get("model_type", "")
+        record = manifest  # flat fields are the active model's record
+    else:
+        model_type = _canonical_model_type(model_type)
+        models = manifest.get("models", {})
+        if model_type not in models:
+            available = sorted(models) or [manifest.get("model_type", "?")]
+            raise ValueError(
+                f"Run {run_id!r} has no trained {model_type!r} model. "
+                f"Available model type(s) for this run: {available}.")
+        record = models[model_type]
 
     feats = np.load(os.path.join(run_dir(run_id), _FEATURES))
     X_test, y_test = feats["X_test"], feats["y_test"]
-    preds = np.asarray(model.predict(X_test)).reshape(-1)
     truths = np.asarray(y_test, dtype=float).reshape(-1)
+
+    if model_type in ("random_forest", "lightgbm", "svr"):
+        with open(record["model_path"], "rb") as fh:
+            model = pickle.load(fh)
+        preds = np.asarray(model.predict(X_test), dtype=float).reshape(-1)
+    elif model_type == "mlp":
+        preds = _evaluate_mlp(record, run_dir(run_id), X_test)
+    elif model_type == "chemprop":
+        # test-split r2/mae were computed at train time (scaffold split) and
+        # stored in the manifest; replay them. Per-molecule predictions are
+        # not persisted for chemprop.
+        return {
+            "run_id": run_id,
+            "model_type": "chemprop",
+            "r2": float(record.get("r2", float("nan"))),
+            "mae": float(record.get("mae", float("nan"))),
+            "n_test": int(record.get("n_test", 0)),
+            "predictions": [],
+            "truths": [],
+        }
+    else:
+        raise ValueError(
+            f"Cannot evaluate run {run_id!r}: manifest model_type is "
+            f"{model_type!r} (expected random_forest/lightgbm/svr/mlp/"
+            f"chemprop). Train a model for this run first.")
 
     return {
         "run_id": run_id,
+        "model_type": model_type,
         "r2": float(r2_score(truths, preds)),
         "mae": float(mean_absolute_error(truths, preds)),
         "n_test": int(len(truths)),
@@ -766,18 +882,95 @@ def evaluate_model(run_id: str) -> dict:
     }
 
 
-def run_inference(run_id: str, smiles_list: list[str]) -> dict:
-    """Predict the target for novel SMILES using a trained model.
+def _evaluate_mlp(record: dict, rd: str, X_test) -> np.ndarray:
+    """Run the saved MLP on the RAW test features and return predictions.
+
+    ``record`` is the MLP's manifest entry -- either the per-type record from
+    manifest["models"]["mlp"] (when evaluate_model was given model_type="mlp")
+    or the flat manifest itself (when evaluating the active model). Both carry
+    mlp_arch / model_path / mlp_prep_path; we fall back to the canonical
+    filenames for older runs that predate the per-type records.
+
+    Replays the train-time preprocessing (DescriptorCleaner keep_mask + median
+    impute -> standardize with train mean/std -> clip +/-100 -> optional PCA)
+    from the saved mlp_prep.npz, loads the torch state_dict, and runs a single
+    inference-mode forward pass. Mirrors predict_single_value's prep block so
+    the test split is scored exactly as it was during train_mlp.
+    """
+    import torch
+    from chemlagent.pytorch_mlp import MLP_Model, prep_data
+
+    arch = record["mlp_arch"]
+    prep_path = record.get("mlp_prep_path") or os.path.join(rd, _MLP_PREP)
+    model_path = record.get("model_path") or os.path.join(rd, _MLP_MODEL)
+    prep = prep_data.load_stats(prep_path)
+
+    # Apply the saved train-time transform to the raw test features (float64
+    # through PCA to avoid overflow on out-of-distribution molecules, then
+    # downcast to float32 for the model). See predict_single_value for the
+    # identical sequence used at inference time.
+    X = np.asarray(X_test, dtype=np.float64)
+    X = np.where(np.isinf(X), np.nan, X)
+    X = X[:, prep.keep_mask]
+    inds = np.where(np.isnan(X))
+    if inds[0].size:
+        X = X.copy()
+        X[inds] = np.take(prep.medians, inds[1])
+    fstd = np.asarray(prep.feature_std, dtype=np.float64).copy()
+    fstd[fstd == 0] = 1.0
+    X = (X - np.asarray(prep.feature_mean, dtype=np.float64)) / fstd
+    X = np.nan_to_num(X, nan=0.0, posinf=0.0, neginf=0.0)
+    X = np.clip(X, -100.0, 100.0)
+    if prep.pca_components is not None:
+        comps = np.asarray(prep.pca_components, dtype=np.float64)
+        pmean = np.asarray(prep.pca_mean, dtype=np.float64)
+        X = (X - pmean) @ comps.T
+        X = np.nan_to_num(X, nan=0.0, posinf=0.0, neginf=0.0)
+
+    Xt = torch.from_numpy(np.ascontiguousarray(X, dtype=np.float32))
+
+    # MLP_Model writes a params file to CWD on construction; run from the run
+    # dir so it lands with the other artifacts instead of the project root.
+    cwd = os.getcwd()
+    os.chdir(os.path.abspath(rd))
+    try:
+        model = MLP_Model(neurons=arch["neurons"], input_dims=arch["input_dims"],
+                          num_hidden_layers=arch["num_hidden_layers"],
+                          skip_connection=arch["skip_connection"])
+    finally:
+        os.chdir(cwd)
+    model.load_state_dict(torch.load(model_path, weights_only=True))
+    Xt = Xt.to(next(model.parameters()).device)
+    model.eval()
+    with torch.inference_mode():
+        preds = model(Xt).cpu().numpy().reshape(-1)
+    return preds
+
+
+def run_inference(run_id: str, smiles_list: list[str],
+                  model_type: str | None = None) -> dict:
+    """Predict the target for novel SMILES using a trained fingerprint model.
 
     Featurizes the given SMILES with the saved fingerprint estimator, predicts
     with the saved model, and inverts the log10 transform applied during data
     prep if the manifest records log_transformed=True (so predictions come back
     in the original units, e.g. IC50 nM).
 
+    This tool covers the sklearn fingerprint models (random_forest / lightgbm /
+    svr). For an MLP use run_inference_mlp; for a Chemprop MPNN use
+    run_inference_chemprop.
+
     Args:
-        run_id: Pipeline run identifier; reads model.pkl, featurizer.pkl, and
-            manifest.json.
+        run_id: Pipeline run identifier; reads model_<type>.pkl,
+            featurizer.pkl, and manifest.json.
         smiles_list: List of SMILES strings to predict for.
+        model_type: Optional. Which trained sklearn model to predict with:
+            'random_forest' (aliases 'rf', 'randomforest'), 'lightgbm' (alias
+            'lgbm'), or 'svr'. If omitted, uses the run's active
+            (most-recently-trained) model. Raises a helpful error naming the
+            available types if the requested one was never trained on the run,
+            or points to run_inference_mlp / run_inference_chemprop if a
+            non-sklearn type is requested.
 
     Returns:
         dict with keys: run_id, log_transformed, predictions (list[float], in
@@ -786,7 +979,25 @@ def run_inference(run_id: str, smiles_list: list[str]) -> dict:
     print("Run inference tool")
     print("=" * 55)
     manifest = _read_manifest(run_id)
-    with open(manifest["model_path"], "rb") as fh:
+    if model_type is None:
+        model_type = manifest.get("model_type", "")
+        record = manifest
+    else:
+        model_type = _canonical_model_type(model_type)
+        if model_type not in ("random_forest", "lightgbm", "svr"):
+            raise ValueError(
+                f"run_inference covers the sklearn fingerprint models only; "
+                f"got {model_type!r}. For an MLP use run_inference_mlp, for a "
+                f"Chemprop MPNN use run_inference_chemprop.")
+        models = manifest.get("models", {})
+        if model_type not in models:
+            available = sorted(t for t in models
+                               if t in ("random_forest", "lightgbm", "svr"))
+            raise ValueError(
+                f"Run {run_id!r} has no trained {model_type!r} model. "
+                f"Available sklearn model type(s): {available or 'none'}.")
+        record = models[model_type]
+    with open(record["model_path"], "rb") as fh:
         model = pickle.load(fh)
     with open(manifest["featurizer_path"], "rb") as fh:
         featurizer = pickle.load(fh)
@@ -908,18 +1119,14 @@ def train_mlp(
     finally:
         os.chdir(cwd)
 
-    manifest = _read_manifest(run_id)
-    manifest.update({
-        "model_type": "mlp",
-        "model_path": model_path,
-        "mlp_prep_path": prep_path,
-        "mlp_arch": {"neurons": 250, "input_dims": input_dims,
-                     "num_hidden_layers": 1, "skip_connection": True},
-        "r2": float(test_r2),
-        "r2_train": float(train_r2),
-        "epochs_run": int(epochs_run),
-    })
-    manifest_path = _write_manifest(run_id, manifest)
+    manifest_path = _record_model(
+        run_id, "mlp", model_path,
+        mlp_prep_path=prep_path,
+        mlp_arch={"neurons": 250, "input_dims": input_dims,
+                  "num_hidden_layers": 1, "skip_connection": True},
+        r2=float(test_r2),
+        r2_train=float(train_r2),
+        epochs_run=int(epochs_run))
     publish_products(run_id, run_dir(run_id), _MLP_MODEL, _MLP_PREP, _MANIFEST)
     return {
         "run_id": run_id,
@@ -1100,17 +1307,13 @@ def train_chemprop(
     model_path = os.path.join(run_dir(run_id), _CHEMPROP_MODEL)
     cm.save_model(model_path)
 
-    manifest = _read_manifest(run_id)
-    manifest.update({
-        "model_type": "chemprop",
-        "model_path": model_path,
-        "is_foundation": False,
-        "r2": r2,
-        "mae": mae,
-        "n_train": int(len(tr_smi)),
-        "n_test": int(len(te_smi)),
-    })
-    manifest_path = _write_manifest(run_id, manifest)
+    manifest_path = _record_model(
+        run_id, "chemprop", model_path,
+        is_foundation=False,
+        r2=r2,
+        mae=mae,
+        n_train=int(len(tr_smi)),
+        n_test=int(len(te_smi)))
     publish_products(run_id, run_dir(run_id), _CHEMPROP_MODEL, _MANIFEST)
     return {
         "run_id": run_id,

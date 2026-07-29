@@ -19,11 +19,14 @@ RUNS_DIR = "runs"
 
 # Files worth keeping as products, by model type. Everything else under a run
 # dir (feature matrices, the featurizer pickle for chemprop, lightning
-# checkpoint dirs) is an intermediate and is discarded at quit.
+# checkpoint dirs) is an intermediate and is discarded at quit. The sklearn
+# models each write their own model_<type>.pkl (see tools._record_model), so a
+# run can hold several of them at once; relocate_all_runs keeps the union over
+# every trained type, not just the active one.
 _KEEP_BY_MODEL: dict[str, tuple[str, ...]] = {
-    "random_forest": ("model.pkl", "featurizer.pkl"),
-    "lightgbm": ("model.pkl", "featurizer.pkl"),
-    "svr": ("model.pkl", "featurizer.pkl"),
+    "random_forest": ("model_random_forest.pkl", "featurizer.pkl"),
+    "lightgbm": ("model_lightgbm.pkl", "featurizer.pkl"),
+    "svr": ("model_svr.pkl", "featurizer.pkl"),
     "mlp": ("mlp_model.pt", "mlp_prep.npz", "featurizer.pkl"),
     "chemprop": ("chemprop_model.pt",),
 }
@@ -97,15 +100,42 @@ def relocate_all_runs(runs_root: str = RUNS_DIR) -> list[str]:
         run_path = os.path.join(runs_root, run_id)
         if not os.path.isdir(run_path):
             continue  # skip loose files (e.g. the foundation-model cache)
+        data: dict = {}
         model_type = None
         mpath = os.path.join(run_path, "manifest.json")
         if os.path.exists(mpath):
             try:
                 with open(mpath) as fh:
-                    model_type = json.load(fh).get("model_type")
+                    data = json.load(fh)
+                    model_type = data.get("model_type")
             except (OSError, json.JSONDecodeError):
-                model_type = None
-        keep = set(_ALWAYS_KEEP) | set(_KEEP_BY_MODEL.get(model_type, ()))
+                data, model_type = {}, None
+
+        # Keep the union of product files across EVERY model trained on the run
+        # (manifest["models"]), not just the active one, so training several
+        # models on one run doesn't strand the non-active ones' files as
+        # "intermediates" at quit. Per-type records carry their own model_path /
+        # mlp_prep_path, which we add explicitly; _KEEP_BY_MODEL covers the
+        # type's other known files (featurizer.pkl etc.).
+        keep = set(_ALWAYS_KEEP)
+        types = set(data.get("models", {}).keys())
+        if model_type:
+            types.add(model_type)
+        for t in types:
+            rec = data.get("models", {}).get(t)
+            if rec:
+                for f in ("model_path", "mlp_prep_path"):
+                    p = rec.get(f)
+                    if p:
+                        keep.add(os.path.basename(str(p)))
+            keep.update(_KEEP_BY_MODEL.get(t, ()))
+        # Always keep the active model_path basename too -- older runs predate
+        # per-type files and saved a single model.pkl, which the loop above
+        # would otherwise miss. Harmless (set) when it's already covered.
+        active_path = data.get("model_path")
+        if active_path:
+            keep.add(os.path.basename(str(active_path)))
+
         dst_dir = recent_work_path(run_id)
         os.makedirs(dst_dir, exist_ok=True)
         for fn in sorted(keep):
@@ -119,18 +149,26 @@ def relocate_all_runs(runs_root: str = RUNS_DIR) -> list[str]:
 
         # Rewrite the manifest's product path fields to their recent_work
         # locations, so the saved manifest still resolves to real files after
-        # runs/<id>/ is deleted.
+        # runs/<id>/ is deleted. Rewrite both the flat active-model fields and
+        # each per-type record's path fields.
         mdest = os.path.join(dst_dir, "manifest.json")
         if os.path.exists(mdest):
             try:
                 with open(mdest) as fh:
                     data = json.load(fh)
-                for field in _PATH_FIELDS:
-                    if field in data:
-                        base = os.path.basename(str(data[field]))
-                        if os.path.exists(os.path.join(dst_dir, base)):
-                            data[field] = os.path.join(
-                                RECENT_WORK_DIR, run_id, base)
+
+                def _rewrite(obj: dict) -> None:
+                    for field in _PATH_FIELDS:
+                        if field in obj:
+                            base = os.path.basename(str(obj[field]))
+                            if os.path.exists(os.path.join(dst_dir, base)):
+                                obj[field] = os.path.join(
+                                    RECENT_WORK_DIR, run_id, base)
+
+                _rewrite(data)
+                for rec in data.get("models", {}).values():
+                    if isinstance(rec, dict):
+                        _rewrite(rec)
                 with open(mdest, "w") as fh:
                     json.dump(data, fh, indent=2)
             except (OSError, json.JSONDecodeError):

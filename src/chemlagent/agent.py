@@ -109,8 +109,13 @@ random_forest {{n_estimators, max_depth, min_samples_leaf, max_features}}, \
 lightgbm {{n_estimators, num_leaves, learning_rate, min_child_samples}}, \
 svr {{C, gamma, epsilon}}. Use it when the user asks to tune or optimize, or \
 when a plain train_model r2 is poor; otherwise train_model is enough.
-4. evaluate_model — evaluate the saved fingerprint model on the held-out test \
-split (not used for chemprop, which reports test metrics at train time).
+4. evaluate_model — evaluate a saved model on the held-out test split (not \
+used for chemprop, which reports test metrics at train time). A run can hold \
+several trained models (one per type); by default the active model is scored, \
+or pass model_type= to score a specific one -- e.g. after training both \
+LightGBM and an MLP on the same run, call evaluate_model(run_id, 'lightgbm') \
+and evaluate_model(run_id, 'mlp') to compare them without retraining. Each \
+trained model stays reachable (its own file + a per-type manifest record).
 5. run_inference / run_inference_mlp / run_inference_chemprop — predict the \
 target for new SMILES using the trained model. Use the SAME run_id. \
 Predictions come back in original units (e.g. IC50 nM or nm) with any log \
