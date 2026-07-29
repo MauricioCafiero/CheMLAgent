@@ -422,7 +422,7 @@ def main(argv=None) -> int:
     for mod in (T, data, pytorch_mlp, models, fingerprints, chemprop_model):
         mod.print_flag = args.print
 
-    model = args.model or DEFAULT_MODELS[0]
+    model = args.model or DEFAULT_MODELS[1]
     client = _make_client()
     messages = [{"role": "system", "content": SYS_MESSAGE}]
 

@@ -232,19 +232,27 @@ def prepare_chembl_csv(
     n_before = len(df)
     df = df.dropna(subset=["SMILES", "target"])
     df = df.drop_duplicates(subset=["SMILES"], keep="last")
+    # Coerce the target to float, DROPPING rows that don't parse instead of
+    # raising "could not convert string to float". An input_csv target column
+    # can contain non-numeric entries -- ChEMBL-style qualifiers ('>', '<',
+    # '~'), 'NA', or a mis-autodetected text column -- and a hard astype(float)
+    # would abort the whole prep on the first such row. errors='coerce' turns
+    # them into NaN so the isfinite filter below drops them cleanly.
+    df = df.assign(target=pd.to_numeric(df["target"], errors="coerce"))
+    df = df.dropna(subset=["target"])
     # Drop non-finite targets always.
-    df = df[np.isfinite(df["target"].astype(float))]
+    df = df[np.isfinite(df["target"])]
 
     # Autodetect log_transform from the target range: a range >= 1000 signals
     # multi-order-of-magnitude data (e.g. nM IC50) that benefits from a log10
     # transform; a small range (e.g. nm wavelengths) stays linear.
-    tvals = df["target"].astype(float)
+    tvals = df["target"].to_numpy(dtype=float)
     log_transform = bool(tvals.max() - tvals.min() >= 1000)
 
     # log10(<=0) is -inf/nan and poisons training -- the ChEMBL dumps contain
     # IC50=0.0 sentinel rows -- so drop non-positive targets only when logging.
     if log_transform:
-        df = df[df["target"].astype(float) > 0]
+        df = df[df["target"] > 0]
     n_dropped = n_before - len(df)
 
     if limit and len(df) > limit:
@@ -252,7 +260,7 @@ def prepare_chembl_csv(
 
     log_transformed = bool(log_transform)
     if log_transformed:
-        df["target"] = np.log10(df["target"].astype(float))
+        df["target"] = np.log10(df["target"])
 
     df = df.reset_index(drop=True)
     df.to_csv(out, index=False)
