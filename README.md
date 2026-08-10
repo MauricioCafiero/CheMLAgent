@@ -11,6 +11,11 @@ inference — and decides which to call to satisfy a modeling request. Ollama
 infers each tool's JSON schema from the function signature + docstring, so the
 "agent" is just a thin dispatch loop over real, reusable chemistry code.
 
+> **`linux-bigdata` branch:** a data-quality audit and modeling investigation
+> of the `big_datasets/` CSVs, plus a Python 3.14 compatibility fix, is
+> written up in [`INVESTIGATION.md`](INVESTIGATION.md). Reusable scripts from
+> that work live under [`big_datasets/scripts/`](big_datasets/scripts/).
+
 ## Pipeline
 
 ```

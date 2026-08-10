@@ -81,6 +81,9 @@ def run_mlp_mordred_pca(run_id, input_csv, epochs, patience, min_delta,
     rd = os.path.abspath(os.path.join("runs", run_id))
     cwd = os.getcwd()
     os.chdir(rd)
+    input_dims = None
+    epochs_run = 0
+    diverged = False
     try:
         prep_d = prep_data(batch_size=batch_size, shuffle=True, reduce_dim="pca",
                            pca_var=pca_var)
@@ -92,7 +95,6 @@ def run_mlp_mordred_pca(run_id, input_csv, epochs, patience, min_delta,
         opt = torch.optim.SGD(mlp.parameters(), lr=lr, weight_decay=weight_decay)
         best_loss = float("inf")
         stale = 0
-        epochs_run = 0
         for epoch in range(epochs):
             epochs_run = epoch + 1
             epoch_loss = train(train_loader, mlp, loss_fn, opt)
@@ -106,12 +108,20 @@ def run_mlp_mordred_pca(run_id, input_csv, epochs, patience, min_delta,
         train_r2, test_r2 = evaluate_regression(
             prep_d.X_train, np.asarray(y_train), prep_d.X_test, np.asarray(y_test), mlp)
         plt.close("all")
+    except Exception as e:
+        # SGD can blow weights up to NaN (most often at a high lr) -- record
+        # the divergence instead of crashing the whole script.
+        train_r2 = float("nan")
+        test_r2 = float("nan")
+        diverged = True
+        print(f"  [diverged] {e}")
     finally:
         os.chdir(cwd)
 
     result = {"n_train": int(feat["n_train"]), "n_test": int(feat["n_test"]),
               "n_components": input_dims, "epochs_run": epochs_run,
-              "train_r2": float(train_r2), "test_r2": float(test_r2)}
+              "train_r2": float(train_r2), "test_r2": float(test_r2),
+              "diverged": diverged}
     show("MLP + Mordred + PCA", result)
     return result
 
