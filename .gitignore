@@ -77,3 +77,7 @@ Thumbs.db
 *.swp
 *.swo
 *~
+
+# ---- big_datasets/scripts/test_dataset.py --mlp-max-rows temp files ----
+# Reproducible subset slices, not source data.
+big_datasets/_*_mlp_subset.csv
