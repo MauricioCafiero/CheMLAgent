@@ -428,7 +428,9 @@ def featurize_fingerprints(
         smiles_list=smiles,
         target_list=targets,
         transform_flag=False,  # target already log-transformed in data.csv
-        n_jobs=-1,
+        n_jobs=1,  # n_jobs=-1 forks joblib/loky workers, which fail to
+        # pickle skfp estimators on Python 3.14 (cannot pickle
+        # '_abc_data'); see train_model's note on lightgbm n_jobs.
     )
     X_train, X_test, y_train, y_test = gfp.create(
         fp_type=fp_type, many_conf=True, num_confs=5, test_size=test_size,
@@ -441,7 +443,7 @@ def featurize_fingerprints(
     # inference tools can call .transform(smiles) directly.
     from chemlagent.fingerprints import SmilesFeaturizer
     featurizer = SmilesFeaturizer(gfp.fp, is_3d=(fp_type in gfp.types_3d),
-                                  many_conf=True, num_confs=5, n_jobs=-1)
+                                  many_conf=True, num_confs=5, n_jobs=1)
     featurizer_path = os.path.join(run_dir(run_id), _FEATURIZER)
     with open(featurizer_path, "wb") as fh:
         pickle.dump(featurizer, fh)

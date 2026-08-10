@@ -42,7 +42,7 @@ class SmilesFeaturizer:
   """
 
   def __init__(self, fp, is_3d: bool, many_conf: bool = True,
-               num_confs: int = 5, n_jobs: int = -1):
+               num_confs: int = 5, n_jobs: int = 1):
     self.fp = fp
     self.is_3d = is_3d
     self.many_conf = many_conf
@@ -73,7 +73,7 @@ class RDKit2DDescriptors:
   set is fixed. (skfp's own `RDKit2DDescriptorsFingerprint` is not available in
   this version, so this thin wrapper fills that slot.)
   """
-  def __init__(self, n_jobs=-1):
+  def __init__(self, n_jobs=1):
     self.n_jobs = n_jobs
 
   def fit(self, X, y=None):
@@ -179,7 +179,7 @@ class get_fingerprints():
   the list are 3D fingerprints and require conformer generation. The rest are 2D 
   fingerprints and do not require conformer generation.
   '''
-  def __init__(self, smiles_list: list[str], target_list: list[float], transform_flag: bool, n_jobs=-1):
+  def __init__(self, smiles_list: list[str], target_list: list[float], transform_flag: bool, n_jobs=1):
     '''
 
     '''
