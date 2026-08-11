@@ -8,18 +8,23 @@ author's other, Mac, machine) rather than merge back into it.
 
 Reusable code produced during this work lives under
 **[`big_datasets/scripts/`](big_datasets/scripts/)** (not a top-level
-`scripts/` dir) — see [Reusable scripts](#reusable-scripts) below.
+`scripts/` dir) — see [Reusable scripts](#reusable-scripts) below. All five
+files in `big_datasets/` (and any future pull from the same source) share
+one export format, and every one had at least one of the same handful of
+problems — see the [cleaning checklist](#cleaning-checklist-for-future-data-pulls)
+before starting on a new file.
 
 ## Contents
 
 - [Environment fix: `n_jobs` pickling crash on Python 3.14](#environment-fix-n_jobs-pickling-crash-on-python-314)
 - [Reusable scripts](#reusable-scripts)
+- [Cleaning checklist for future data pulls](#cleaning-checklist-for-future-data-pulls)
 - [Dataset quality audit](#dataset-quality-audit)
 - [ld50_data.csv deep dive](#ld50_datacsv-deep-dive)
 - [deltaH of fusion: clean + grid scan](#deltah-of-fusion-clean--grid-scan)
 - [Water solubility: clean + test](#water-solubility-clean--test)
 - [Blood-brain barrier permeability (logBB): clean + grid scan](#blood-brain-barrier-permeability-logbb-clean--grid-scan)
-- [pKa: clean + baseline (grid scan not yet run)](#pka-clean--baseline-grid-scan-not-yet-run)
+- [pKa: clean + scaffold-diverse sample + grid scan](#pka-clean--scaffold-diverse-sample--grid-scan)
 - [Cross-dataset takeaways](#cross-dataset-takeaways)
 - [Status / next steps (pick up here)](#status--next-steps-pick-up-here)
 
@@ -82,7 +87,84 @@ consolidated into two parameterized, argparse-driven scripts under
       --run-id deltah_clean_full --limit 0
   ```
 
-Both were smoke-tested against a real run before being committed.
+- **`big_datasets/scripts/clean_csv.py`** — general-purpose cleaner for
+  this data source's format (see the checklist below): tolerant parsing,
+  target-column selection + outlier filtering, SMILES deduplication
+  (median by default), optional Murcko-scaffold-diverse downsampling to a
+  target size (`--scaffold-sample`, the technique used for pKa below), and
+  a final shuffle. Consolidates the four near-identical one-off cleaning
+  scripts written for deltaH/water_sol/bbb_perm/pKa in this investigation.
+
+  ```bash
+  uv run python big_datasets/scripts/clean_csv.py \
+      --input big_datasets/newfile.csv --target-col "Some Raw Property" \
+      --output big_datasets/newfile_clean.csv \
+      --min -10 --max 30 --scaffold-sample 2000
+  ```
+
+All three were smoke-tested against a real run (or, for `clean_csv.py`,
+against every already-known cleaning result in this document, both the
+plain-dedup and the scaffold-sampling code paths) before being committed.
+
+## Cleaning checklist for future data pulls
+
+Every one of the five `big_datasets/` files hit at least one of these.
+Check for all of them before trusting a new pull from the same source:
+
+1. **The target column won't autodetect.** `prepare_chembl_csv`'s
+   `_TARGET_HINTS` never matched any of the five files' raw or converted
+   column names — plan to pass `--target-col` (to `clean_csv.py`) or
+   rename the column before calling `prepare_chembl_csv`.
+2. **Spot-check the `{measured, converted}` column against a known
+   reference value by hand before trusting it.** It was silently wrong
+   for pKa (missing sign flip: `10^(+pKa)` instead of `10^(-pKa)`), and
+   the *raw* column was the safer choice for both pKa and logBB — but was
+   *correct* and the better choice for water_sol and deltaH. There's no
+   rule that always picks the right column; verify a handful of rows
+   arithmetically (e.g. does `10^raw` or `10^-raw` reproduce the converted
+   value? does multiplying by the known unit-conversion factor work out?).
+3. **Try reading the raw file with pandas' default C parser first, and
+   expect it to maybe fail outright** (`ParserError`, not just a warning)
+   from unescaped embedded quotes in NAME-type fields — `water_sol_data.csv`
+   did. `clean_csv.py` always reads tolerantly
+   (`on_bad_lines="skip", engine="python"`) so this is handled by default,
+   but note how many rows got silently dropped.
+4. **Check the raw (non-"converted") column's `UNIT{...}` value counts**
+   before using it directly — it's often not one unit. `water_sol_data.csv`'s
+   raw column mixed 21 different units, some sign-flipped
+   (`log(mol/L)` vs `-log(M)`). The `{measured, converted}` column is
+   usually (not always, see #2) the safer bet specifically because it's
+   unit-normalized.
+5. **Filter physically-impossible outliers before handing the column to
+   `prepare_chembl_csv`.** A wide-enough outlier (pKa's mis-entered
+   perfluorocarboxylic acids at 2575-3128) can push the column range past
+   `prepare_chembl_csv`'s auto-log-transform threshold (max-min ≥ 1000)
+   and cause it to silently drop every negative-valued row when it
+   shouldn't be log-transforming at all.
+6. **Check duplicate-SMILES agreement before assuming the dataset is one
+   consistent endpoint** — cross-tabulate against any species/route/
+   solvent/condition columns present. ld50 turned out to mix ~20 species
+   and 11 administration routes under one nominal unit; some files (logBB,
+   deltaH, water_sol once cleaned) had tight duplicate agreement and no
+   such confound. Median-aggregate duplicates (`--dedup median`, the
+   default) rather than an arbitrary `keep="last"` when they do agree.
+7. **Shuffle the cleaned CSV before saving** (`clean_csv.py` does this by
+   default). `groupby`-based dedup leaves rows in alphabetical-SMILES
+   order, and `prepare_chembl_csv`'s default `limit=2000` just takes
+   `df.iloc[:limit]` for a local CSV with no shuffle — an unshuffled file
+   hands it a structurally biased slice. This measurably hurt deltaH's
+   results before it was fixed (see below).
+8. **If the deduplicated file is too large for a full hyperparameter grid
+   scan in reasonable time** (rule of thumb from this investigation: a
+   243-combo scan on ~2000 rows takes low hours; pKa's 10862-row set
+   would've taken ~11h), use `--scaffold-sample` to downsample to ~2000
+   rows spread across as many distinct Murcko scaffolds as possible,
+   rather than a plain random subsample (which risks skewing toward the
+   most common structural motifs) — then confirm the sample is
+   representative with a quick baseline test before committing to the
+   full scan.
+9. **Set a sleep inhibitor before launching anything that'll run
+   unattended for more than ~1 hour** — see `CLAUDE.md`.
 
 ## Dataset quality audit
 
@@ -253,7 +335,7 @@ down accordingly (`--lr "0.00002,0.00005,0.0001"` instead of the standard
   the pKa baseline test and diagnostics — worth remembering before sizing
   the next scan's ETA.
 
-## pKa: clean + baseline (grid scan not yet run)
+## pKa: clean + scaffold-diverse sample + grid scan
 
 `pka_mc.csv` (14248 rows) used the raw `pKa` column (the converted column is
 broken, see the quality-audit table), filtered to `[-10, 30]` to drop 5
@@ -264,18 +346,61 @@ would otherwise push the column range past `prepare_chembl_csv`'s
 compound), median-aggregated by SMILES (14217→10862 unique compounds), and
 shuffled before saving → `big_datasets/pka_mc_clean.csv`.
 
-Baseline only (`test_dataset.py --mlp-max-rows 5000 --mlp-lr 0.0001`, RF on
-the full 10862 rows):
+Baseline (`test_dataset.py --mlp-max-rows 5000 --mlp-lr 0.0001`, RF on the
+full 10862 rows):
 
 | model | test R² | notes |
 |---|---|---|
 | RF + ECFP (full 10862 rows) | **0.467** | train R²=0.946 |
 | MLP + Mordred+PCA (5000-row subset, lr=0.0001) | 0.226 | train R²=0.419, 159 components, no divergence |
 
-Both models show real signal despite pKa's inherent multi-site-ionization
-noise (see quality audit) — promising enough to warrant a grid scan, but
-**the scan was not run this session** — see
-[Status / next steps](#status--next-steps-pick-up-here).
+### Scaffold-diverse ~2K sample, for a grid scan at a tractable size
+
+10862 unique compounds was too large for a 243-combo grid at the tuned
+lr range in reasonable time (a timing probe on the 5000-row MLP subset
+came back at ~166s/combo, ~11h uncontended estimate for the full set). A
+Murcko scaffold breakdown found **2015 unique scaffolds** among the 10862
+compounds (9 SMILES failed to parse/scaffold) — heavily skewed (benzene
+alone: 2281 compounds, 21%; acyclic/no-ring: 1554, 14%; 63% of scaffolds
+are singletons). Taking exactly one random representative per scaffold
+gives full scaffold-diversity coverage at almost exactly the ~2K target,
+with no extra quota-sampling logic needed → shuffled →
+`big_datasets/pka_mc_clean_scaffold2k.csv` (2015 rows).
+
+Baseline on this sample confirmed it's representative (RF test R²=0.397,
+MLP test R²=0.240, both close to the full-set baseline above). A
+243-combo grid scan (`--lr "0.00002,0.00005,0.0001"`, the same safe range
+bbb_perm needed) then found:
+
+- **Best: test R² = 0.325** (500 neurons, 0 extra hidden layers, lr=1e-4,
+  weight_decay=0.2, pca_var=0.99 → 265 components, train R²=0.487). Zero
+  divergence across all 243 combos; a tight, well-behaved distribution
+  (min 0.155, mean 0.234, median 0.237, std 0.058) — no catastrophic
+  outliers like deltaH's, but a clearly lower ceiling than bbb_perm's or
+  deltaH's.
+- **`pca_var` direction flips here** — `0.99` (mean 0.303) clearly beats
+  `0.90` (mean 0.164), the opposite of bbb_perm (`0.95` best), ld50
+  (`0.90` best), and deltaH (`0.90` among the better values). Consistent
+  with pKa's chemistry: subtle, site-specific electronic effects appear to
+  need more retained variance to capture, so compressing to 90% variance
+  throws away real pKa-relevant signal.
+- `neurons`/`num_hidden_layers` are flat again (mean ~0.23-0.24
+  regardless) — capacity was never the bottleneck on any dataset in this
+  investigation.
+- The grid meaningfully beat the naive-default-pca_var baseline (0.325 vs
+  0.240, ~35% relative gain, mostly from finding pca_var=0.99 over the
+  default 0.95) — but **RF still wins overall on pKa** (0.467 baseline
+  > any MLP grid result), unlike bbb_perm/water_sol where the tuned MLP
+  eventually overtook RF. The lower ceiling versus bbb_perm/deltaH tracks
+  with the quality audit's finding that pKa is inherently multi-valued per
+  molecule (site-specific ionization ambiguity) — a cap no amount of
+  tuning removes.
+- This scan got killed twice mid-run by the machine's 1-hour idle
+  auto-suspend (active even on AC power) before that was diagnosed and
+  fixed with a `systemd-inhibit` lock — see `CLAUDE.md` (repo) and the
+  global `~/.claude/CLAUDE.md` for the pattern. No progress was lost either
+  time (`mlp_grid_scan.py` writes incrementally and resumes automatically),
+  just wall-clock time to notice and relaunch.
 
 ## Cross-dataset takeaways
 
@@ -304,43 +429,50 @@ noise (see quality audit) — promising enough to warrant a grid scan, but
    survive if the input CSV isn't randomly ordered (fixed by shuffling
    both clean CSVs at save time).
 5. **Once cleaned, 4 of 5 files show real, positive, learnable signal**
-   (bbb_perm, deltaH, water_sol, and pKa's baseline) — the initial run of
-   negative-R² results across this investigation was mostly a data-quality
-   artifact (ld50's mixed endpoints, or a diverging default lr), not a
-   sign that these properties are inherently hard to model from structure.
+   (bbb_perm, deltaH, water_sol, pKa) — the initial run of negative-R²
+   results across this investigation was mostly a data-quality artifact
+   (ld50's mixed endpoints, or a diverging default lr), not a sign that
+   these properties are inherently hard to model from structure.
+6. **`pca_var`'s optimal value is dataset-specific, not just its
+   *safe* lr range.** More retained variance (0.99, more PCA components)
+   was clearly *best* for pKa, but clearly *worst* (or a source of
+   instability) for bbb_perm, ld50, and deltaH. Don't assume the direction
+   of any hyperparameter effect transfers across datasets — rerun the
+   analysis (or at least eyeball the per-hyperparameter means/medians) for
+   each new one.
+7. **One representative-per-Murcko-scaffold is a good way to shrink an
+   oversized dataset for a grid scan** without a naive random subsample's
+   risk of skewing toward the most common structural motifs (pKa's 10862
+   compounds collapsed to 2015 unique scaffolds — almost exactly the ~2K
+   target size, so no extra quota logic was even needed). Confirm the
+   sample is representative with a quick baseline test before committing
+   to a full grid scan on it.
+8. **This machine auto-suspends after 1 hour idle, even on AC power**,
+   and will silently kill unattended background jobs — see `CLAUDE.md`
+   for the `systemd-inhibit` fix. Set the inhibitor *before* launching
+   anything expected to run unattended for more than ~1 hour.
 
 ## Status / next steps (pick up here)
 
 Where this session left off:
 
-- **Done and pushed**: `n_jobs` fix, both reusable scripts, and clean+tested
+- **Done and pushed**: `n_jobs` fix, both reusable scripts, the
+  sleep-inhibitor fix (`CLAUDE.md`, repo and global), and clean+tested
   results for ld50 (deep dive only, no clean version — see takeaway #2),
-  deltaH (clean + full grid scan), water_sol (clean + baseline test), and
-  bbb_perm (clean + full grid scan, the best result in the investigation).
-- **Not yet done**: **pKa's grid scan**. The baseline (RF 0.467, MLP 0.226)
-  is promising enough to justify one, but a timing probe on the 5000-row
-  MLP subset came back at ~166s/combo *with* CPU contention from the
-  bbb_perm scan running at the same time — full 243 combos at that subset
-  size could be ~11 hours uncontended, longer with contention. Options
-  discussed but not decided:
-  1. Shrink the MLP subset (e.g. 2000 rows) — proportionally faster, less
-     data.
-  2. Narrow the grid (fewer pca_var/neuron values) — fewer combos, less
-     exhaustive.
-  3. Skip the grid scan; the baseline alone may be enough evidence pKa is
-     modelable.
-  4. Run it at full scope anyway, accepting the long wall-clock time (run
-     it uncontended — nothing else should be running at the same time,
-     unlike this session's bbb_perm scan, which lost real time to
-     concurrent baseline tests and diagnostics).
-  Pick a lr range from a quick single-combo timing+stability probe first
-  (like the bbb_perm section above did — don't assume `1e-4` is safe across
-  the whole grid just because the baseline used it successfully once).
+  deltaH (clean + full grid scan), water_sol (clean + baseline test),
+  bbb_perm (clean + full grid scan, best single-combo result at 0.526),
+  and pKa (clean + scaffold-diverse 2K sample + full grid scan, best
+  0.325 but RF still wins overall at 0.467).
 - **Not started**: no further cleaning was attempted on `ld50_data.csv`
   itself. The ld50 deep dive's own suggestion — subsample the mixed dataset
   down to match the earthworm/rat-inhalation subset sizes, to isolate
   whether label noise or sample size is really the bottleneck — was never
   run. That's the natural next experiment if ld50 is worth revisiting.
+- **Also not started**: no grid scan for water_sol (only a baseline test on
+  a 5000-row subset was run; its full clean set is 18484 rows, the largest
+  in `big_datasets/` — the one-per-Murcko-scaffold trick used for pKa could
+  size it down to something tractable the same way, worth trying if
+  water_sol's MLP result is worth pushing past 0.592).
 - **Branch hygiene**: `src/agent_template.py` and
   `src/chemlagent/modrag_protein_functions.py` still show as locally
   modified (pure CRLF/whitespace noise, verified byte-identical to HEAD
