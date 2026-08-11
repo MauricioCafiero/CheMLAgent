@@ -26,6 +26,20 @@ tolerant parsing, target selection + outlier filtering, median/mean/
 keep-last deduplication by SMILES, optional Murcko-scaffold-diverse
 downsampling to a target size, and a final shuffle.
 
+NOT SAFE, without a manual check first, for biological/bioactivity data with
+multiple assay conditions (organism, administration route, tissue, cell
+line, assay type, ...). Deduplication here groups by SMILES alone -- it has
+no notion of a condition column, so pointing this at an unchecked file
+silently averages together measurements that may not be the same endpoint.
+This is exactly what's wrong with ld50_data.csv (mixes ~20 species and 11
+administration routes under one nominal unit) -- cross-tabulate duplicate
+SMILES against any species/route/solvent/tissue/condition columns present
+BEFORE running this script, and either filter to one consistent condition
+first or don't use this script at all if no single condition dominates.
+Safe for physicochemical or single-well-defined-endpoint properties where
+that check has been done and duplicate-SMILES agreement is tight (as it was
+for deltaH/water_sol/bbb_perm/pKa in this investigation).
+
 Usage:
     uv run python big_datasets/scripts/clean_csv.py \\
         --input big_datasets/newfile.csv \\

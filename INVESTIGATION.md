@@ -102,6 +102,22 @@ consolidated into two parameterized, argparse-driven scripts under
       --min -10 --max 30 --scaffold-sample 2000
   ```
 
+  **⚠️ Not safe for biological/bioactivity data with multiple assay
+  conditions (organism, administration route, tissue, cell line, assay
+  type, ...) without checking first.** `clean_csv.py`'s dedup blindly
+  groups by SMILES alone — it has no notion of a condition column, so
+  pointing it at a file like `ld50_data.csv` (mixed species/routes/units)
+  would silently reproduce that exact problem: averaging together
+  measurements that are not the same endpoint, with no warning. It's safe
+  for `deltaH`/`water_sol`/`bbb_perm`/`pKa`-style physicochemical or
+  single-well-defined-endpoint properties (where duplicate-SMILES
+  agreement was checked and found tight — see the quality audit) but was
+  deliberately **not** run on `ld50_data.csv` for this reason. For any new
+  bioactivity-style file, do the cross-tabulation-against-condition-columns
+  check (checklist item #6) by hand *before* running `clean_csv.py`, and
+  either filter to one consistent condition first or don't use this script
+  at all if no single condition dominates the file.
+
 All three were smoke-tested against a real run (or, for `clean_csv.py`,
 against every already-known cleaning result in this document, both the
 plain-dedup and the scaffold-sampling code paths) before being committed.
@@ -142,10 +158,15 @@ Check for all of them before trusting a new pull from the same source:
    and cause it to silently drop every negative-valued row when it
    shouldn't be log-transforming at all.
 6. **Check duplicate-SMILES agreement before assuming the dataset is one
-   consistent endpoint** — cross-tabulate against any species/route/
-   solvent/condition columns present. ld50 turned out to mix ~20 species
-   and 11 administration routes under one nominal unit; some files (logBB,
-   deltaH, water_sol once cleaned) had tight duplicate agreement and no
+   consistent endpoint — do this manually, `clean_csv.py` does not check
+   for you.** Cross-tabulate against any species/route/solvent/tissue/
+   assay-type/condition columns present *before* running `clean_csv.py`;
+   its dedup blindly groups by SMILES alone with no awareness of such
+   columns, so pointing it at an unchecked file risks silently reproducing
+   ld50's exact problem (see the `clean_csv.py` warning above). ld50 turned
+   out to mix ~20 species and 11 administration routes under one nominal
+   unit; some files (logBB, deltaH, water_sol once cleaned) had tight
+   duplicate agreement and no
    such confound. Median-aggregate duplicates (`--dedup median`, the
    default) rather than an arbitrary `keep="last"` when they do agree.
 7. **Shuffle the cleaned CSV before saving** (`clean_csv.py` does this by
