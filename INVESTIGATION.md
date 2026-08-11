@@ -22,7 +22,7 @@ before starting on a new file.
 - [Dataset quality audit](#dataset-quality-audit)
 - [ld50_data.csv deep dive](#ld50_datacsv-deep-dive)
 - [deltaH of fusion: clean + grid scan](#deltah-of-fusion-clean--grid-scan)
-- [Water solubility: clean + test](#water-solubility-clean--test)
+- [Water solubility: clean + test + grid scan](#water-solubility-clean--test--grid-scan)
 - [Blood-brain barrier permeability (logBB): clean + grid scan](#blood-brain-barrier-permeability-logbb-clean--grid-scan)
 - [pKa: clean + scaffold-diverse sample + grid scan](#pka-clean--scaffold-diverse-sample--grid-scan)
 - [Cross-dataset takeaways](#cross-dataset-takeaways)
@@ -313,7 +313,7 @@ deltah_clean_full`) then found:
   wd=0.50's 0.289) — consistent with there being real signal worth fitting
   rather than pure noise to guard against.
 
-## Water solubility: clean + test
+## Water solubility: clean + test + grid scan
 
 `water_sol_data.csv` (53488 raw rows) was read past its 8 malformed rows
 with `on_bad_lines="skip", engine="python"`, the `{measured, converted}`
@@ -338,11 +338,46 @@ The MLP result needed one hyperparameter change: the tuned default
 blew weights to NaN even though this exact lr is safe on every other
 dataset tried in this investigation); dropping to `lr=0.0005` — one of the
 values the deltaH grid scan already flagged as generally safer — trained
-cleanly. This is the best result of the whole investigation, and makes
-sense: water solubility is one of the best-studied, most learnable QSPR
+cleanly. Water solubility is one of the best-studied, most learnable QSPR
 endpoints in the cheminformatics literature, and this file turned out to be
 the cleanest one once its structural (not label-consistency) problems were
 fixed.
+
+### Scaffold-diverse ~2K sample + grid scan
+
+water_sol's 18484 clean rows is the largest file in `big_datasets/` and too
+big for a 243-combo grid in reasonable time, same problem as pKa. Applying
+`clean_csv.py --scaffold-sample 2000` directly to the raw file found
+**2857 unique Murcko scaffolds** among 18455 usable compounds — *more*
+scaffolds than the 2000 target this time (unlike pKa's near-exact 2015),
+so the sample is 2000 randomly-chosen distinct scaffolds, one representative
+each → `big_datasets/water_sol_data_scaffold2k.csv`.
+
+Baseline on this sample: RF test R²=0.426, MLP test R²=0.532 (both stable
+at `lr=0.0005`, no divergence) — comparable to the full-set baseline above,
+confirming it's representative. A 243-combo grid scan (with the sleep
+inhibitor active throughout this time — see `CLAUDE.md`) then found:
+
+- **Best: test R² = 0.564** (64 neurons, 1 extra hidden layer, lr=2e-5,
+  weight_decay=0.5, pca_var=0.99 → 291 components, train R²=0.656 — a
+  **0.09 train/test gap**, the tightest of any best-combo in this
+  investigation). Zero divergence across all 243 combos.
+- **By far the most consistent result found**: min 0.493, max 0.564, mean
+  0.536, median 0.537, **std 0.012** — every single combo landed in a
+  narrow 0.49-0.56 band. Compare to bbb_perm's std of 0.046 or deltaH's
+  wild, outlier-driven swings. Every hyperparameter effect is mild (lr
+  matters most, and even that's only a 0.018 mean gap between 2e-5 and
+  5e-4) — this property is robustly learnable close to regardless of how
+  the network is configured.
+- **Honest caveat: this grid's best (0.564) is slightly below the original
+  single-run baseline on the larger, randomly-sampled 5000-row subset
+  (0.592).** Two likely reasons, probably both at once: less training data
+  here (1600 vs ~4000 rows), and the scaffold-diverse split deliberately
+  maximizes train/test structural dissimilarity — a harder, arguably more
+  meaningful generalization test than a random split, not a weaker
+  featurization. The grid's real contribution isn't a new peak number; it's
+  confirming the earlier 0.592 wasn't a lucky single run — the whole
+  hyperparameter space around it works reliably.
 
 ## Blood-brain barrier permeability (logBB): clean + grid scan
 
@@ -491,37 +526,57 @@ bbb_perm needed) then found:
    each new one.
 7. **One representative-per-Murcko-scaffold is a good way to shrink an
    oversized dataset for a grid scan** without a naive random subsample's
-   risk of skewing toward the most common structural motifs (pKa's 10862
-   compounds collapsed to 2015 unique scaffolds — almost exactly the ~2K
-   target size, so no extra quota logic was even needed). Confirm the
-   sample is representative with a quick baseline test before committing
-   to a full grid scan on it.
+   risk of skewing toward the most common structural motifs. Worked both
+   ways round: pKa's 10862 compounds collapsed to almost exactly 2015
+   unique scaffolds (no extra quota logic needed), while water_sol's 18455
+   collapsed to *more* scaffolds than the 2000 target (2857), exercising
+   the random-subset-of-scaffolds path instead. Confirm the sample is
+   representative with a quick baseline test before committing to a full
+   grid scan on it either way.
 8. **This machine auto-suspends after 1 hour idle, even on AC power**,
    and will silently kill unattended background jobs — see `CLAUDE.md`
    for the `systemd-inhibit` fix. Set the inhibitor *before* launching
    anything expected to run unattended for more than ~1 hour.
+9. **A scaffold-diverse split can score *lower* than a random split on the
+   same underlying data, without that meaning anything is wrong** —
+   water_sol's scaffold-2K grid scan (best 0.564) never quite reached the
+   earlier random-5000-subset single run (0.592), most likely because
+   forcing train/test structural dissimilarity is a genuinely harder
+   generalization test, not a worse model. Don't compare R² across
+   different sampling schemes as if they were the same benchmark.
+10. **Grid-scan result *consistency* (std across all 243 combos) is as
+    informative as the best single number** — water_sol's scan (std=0.012,
+    every combo landed 0.49-0.56) says this property is robustly learnable
+    almost regardless of hyperparameters; deltaH's scan (wild swings, one
+    combo at −47) says the opposite about that model/feature combination,
+    even though its peak (0.572) was nominally higher than water_sol's
+    (0.564). The peak number alone would have hidden that difference.
 
 ## Status / next steps (pick up here)
 
 Where this session left off:
 
-- **Done and pushed**: `n_jobs` fix, both reusable scripts, the
-  sleep-inhibitor fix (`CLAUDE.md`, repo and global), and clean+tested
-  results for ld50 (deep dive only, no clean version — see takeaway #2),
-  deltaH (clean + full grid scan), water_sol (clean + baseline test),
-  bbb_perm (clean + full grid scan, best single-combo result at 0.526),
-  and pKa (clean + scaffold-diverse 2K sample + full grid scan, best
-  0.325 but RF still wins overall at 0.467).
+- **Done and pushed**: `n_jobs` fix, all four reusable scripts (including
+  `audit_csv.py`, the decision-support scan), the sleep-inhibitor fix
+  (`CLAUDE.md`, repo and global), and clean+tested results for all five
+  files: ld50 (deep dive + mixed/earthworm/rat-inhalation comparison, no
+  clean version — see takeaway #2), deltaH (clean + full grid scan, best
+  0.572 but noisy/outlier-prone), bbb_perm (clean + full grid scan, best
+  0.526, zero divergence, the most *positive* grid), pKa (clean +
+  scaffold-diverse 2K sample + full grid scan, best 0.325 but RF wins
+  overall at 0.467), and water_sol (clean + baseline + scaffold-diverse 2K
+  grid scan, best 0.564 but the *most consistent* grid — std 0.012 across
+  all 243 combos, see takeaway #10).
 - **Not started**: no further cleaning was attempted on `ld50_data.csv`
   itself. The ld50 deep dive's own suggestion — subsample the mixed dataset
   down to match the earthworm/rat-inhalation subset sizes, to isolate
   whether label noise or sample size is really the bottleneck — was never
   run. That's the natural next experiment if ld50 is worth revisiting.
-- **Also not started**: no grid scan for water_sol (only a baseline test on
-  a 5000-row subset was run; its full clean set is 18484 rows, the largest
-  in `big_datasets/` — the one-per-Murcko-scaffold trick used for pKa could
-  size it down to something tractable the same way, worth trying if
-  water_sol's MLP result is worth pushing past 0.592).
+- **Every dataset in `big_datasets/` has now been through at least a
+  baseline test, and 4 of 5 (all but ld50) have a full grid scan.** If
+  there's a next dataset to investigate, it'd be a genuinely new pull from
+  this data source rather than more work on these five — see the cleaning
+  checklist and `audit_csv.py` above for where to start.
 - **Branch hygiene**: `src/agent_template.py` and
   `src/chemlagent/modrag_protein_functions.py` still show as locally
   modified (pure CRLF/whitespace noise, verified byte-identical to HEAD
