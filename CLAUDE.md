@@ -33,3 +33,28 @@ There is a teamplate for the agentic part in scr/
 - convert classes into functions that are callable from the ollama api.
 - make dockstrings into informative docktrings that the ollama api can use
 - wire the tools into the ollama code. 
+
+## launching long-running background jobs (e.g. grid scans)
+
+This machine auto-suspends after 1 hour idle, even on AC power (GNOME
+`sleep-inactive-ac-timeout=3600`, type `suspend`) -- this killed a
+background MLP grid scan mid-run more than once (see
+`INVESTIGATION.md`). Before launching anything expected to run
+unattended for more than ~1 hour, set a sleep/idle inhibitor first:
+
+```bash
+systemd-inhibit --what=sleep:idle --who="CheMLAgent" \
+    --why="Running background ML grid scans" --mode=block sleep infinity &
+disown
+```
+
+Verify it's active with `systemd-inhibit --list` (look for a `CheMLAgent`
+row). Release it once the job finishes (or the user says they're stepping
+away) by killing that `sleep infinity` process -- don't leave it running
+indefinitely, since it blocks suspend for the whole session, not just the
+job.
+
+The grid scan script (`big_datasets/scripts/mlp_grid_scan.py`) writes
+results incrementally and resumes from the last completed row if a run
+gets interrupted regardless, so a missed inhibitor isn't catastrophic --
+just a lost few hours' progress and a manual resume.
