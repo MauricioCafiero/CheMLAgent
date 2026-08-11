@@ -56,8 +56,28 @@ libomp double-load segfault. All 25 tests pass after the fix.
 Six near-duplicate one-off scratch scripts (three copies of a 243-combo MLP
 hyperparameter grid scan, three copies of a prepare→featurize→train→evaluate
 baseline test, each differing only in which run/CSV they pointed at) were
-consolidated into two parameterized, argparse-driven scripts under
-`big_datasets/scripts/`:
+consolidated into parameterized, argparse-driven scripts under
+`big_datasets/scripts/`. Recommended order for a new file from this data
+source: **`audit_csv.py`** first (decide whether it's safe to clean), then
+**`clean_csv.py`**, then **`test_dataset.py`**, then optionally
+**`mlp_grid_scan.py`**.
+
+- **`big_datasets/scripts/audit_csv.py`** — decision-support scan, prints a
+  report rather than cleaning anything: duplicate-SMILES rate and
+  disagreement (log10 scale, with the worst-disagreement groups printed in
+  full across every detected condition column — this is how ld50's
+  species/route mixing was first found, and the script reproduces that
+  exact finding automatically), every "condition-like" column found by
+  keyword (organism, route, tissue, solvent, assay, ...) with its value
+  counts, and the raw column's `UNIT{...}` breakdown. Run this **before**
+  `clean_csv.py` on any new file — it's what tells you whether the file is
+  a single consistent endpoint or needs the `ld50_data.csv` treatment (see
+  the warning on `clean_csv.py` below).
+
+  ```bash
+  uv run python big_datasets/scripts/audit_csv.py \
+      --input big_datasets/newfile.csv --target-col "Some Raw Property"
+  ```
 
 - **`big_datasets/scripts/mlp_grid_scan.py`** — sweeps
   `neurons × num_hidden_layers × lr × weight_decay × pca_var` (3 values each
@@ -118,9 +138,13 @@ consolidated into two parameterized, argparse-driven scripts under
   either filter to one consistent condition first or don't use this script
   at all if no single condition dominates the file.
 
-All three were smoke-tested against a real run (or, for `clean_csv.py`,
-against every already-known cleaning result in this document, both the
-plain-dedup and the scaffold-sampling code paths) before being committed.
+All four were smoke-tested against a real run before being committed —
+`clean_csv.py` against every already-known cleaning result in this document
+(both the plain-dedup and the scaffold-sampling code paths), and
+`audit_csv.py` against `ld50_data.csv` (correctly reproduced the
+species/route mixing finding, worst-groups printout included) and
+`deltah_fusion_data.csv` (correctly showed a single raw unit, zero
+condition-like columns, and tight duplicate agreement).
 
 ## Cleaning checklist for future data pulls
 
@@ -132,7 +156,9 @@ Check for all of them before trusting a new pull from the same source:
    column names — plan to pass `--target-col` (to `clean_csv.py`) or
    rename the column before calling `prepare_chembl_csv`.
 2. **Spot-check the `{measured, converted}` column against a known
-   reference value by hand before trusting it.** It was silently wrong
+   reference value by hand before trusting it** — `audit_csv.py` flags
+   when one exists but can't verify it's *correct*, only that it's
+   present; the arithmetic check is still manual. It was silently wrong
    for pKa (missing sign flip: `10^(+pKa)` instead of `10^(-pKa)`), and
    the *raw* column was the safer choice for both pKa and logBB — but was
    *correct* and the better choice for water_sol and deltaH. There's no
@@ -142,15 +168,15 @@ Check for all of them before trusting a new pull from the same source:
 3. **Try reading the raw file with pandas' default C parser first, and
    expect it to maybe fail outright** (`ParserError`, not just a warning)
    from unescaped embedded quotes in NAME-type fields — `water_sol_data.csv`
-   did. `clean_csv.py` always reads tolerantly
+   did. `clean_csv.py`/`audit_csv.py` always read tolerantly
    (`on_bad_lines="skip", engine="python"`) so this is handled by default,
    but note how many rows got silently dropped.
 4. **Check the raw (non-"converted") column's `UNIT{...}` value counts**
-   before using it directly — it's often not one unit. `water_sol_data.csv`'s
-   raw column mixed 21 different units, some sign-flipped
-   (`log(mol/L)` vs `-log(M)`). The `{measured, converted}` column is
-   usually (not always, see #2) the safer bet specifically because it's
-   unit-normalized.
+   before using it directly — it's often not one unit. `audit_csv.py`
+   prints this automatically. `water_sol_data.csv`'s raw column mixed 21
+   different units, some sign-flipped (`log(mol/L)` vs `-log(M)`). The
+   `{measured, converted}` column is usually (not always, see #2) the
+   safer bet specifically because it's unit-normalized.
 5. **Filter physically-impossible outliers before handing the column to
    `prepare_chembl_csv`.** A wide-enough outlier (pKa's mis-entered
    perfluorocarboxylic acids at 2575-3128) can push the column range past
@@ -159,11 +185,13 @@ Check for all of them before trusting a new pull from the same source:
    shouldn't be log-transforming at all.
 6. **Check duplicate-SMILES agreement before assuming the dataset is one
    consistent endpoint — do this manually, `clean_csv.py` does not check
-   for you.** Cross-tabulate against any species/route/solvent/tissue/
-   assay-type/condition columns present *before* running `clean_csv.py`;
-   its dedup blindly groups by SMILES alone with no awareness of such
-   columns, so pointing it at an unchecked file risks silently reproducing
-   ld50's exact problem (see the `clean_csv.py` warning above). ld50 turned
+   for you.** Run `audit_csv.py` first — it cross-tabulates disagreement
+   against any species/route/solvent/tissue/assay-type/condition columns
+   present automatically, and prints the worst-disagreeing groups in full
+   so the cause is visible at a glance. `clean_csv.py`'s dedup blindly
+   groups by SMILES alone with no awareness of such columns, so pointing
+   it at an unaudited file risks silently reproducing ld50's exact problem
+   (see the `clean_csv.py` warning above). ld50 turned
    out to mix ~20 species and 11 administration routes under one nominal
    unit; some files (logBB, deltaH, water_sol once cleaned) had tight
    duplicate agreement and no
