@@ -30,7 +30,9 @@ _KEEP_BY_MODEL: dict[str, tuple[str, ...]] = {
     "mlp": ("mlp_model.pt", "mlp_prep.npz", "featurizer.pkl"),
     "chemprop": ("chemprop_model.pt",),
 }
-# Always-kept products regardless of model type.
+# Always-kept products regardless of model type. EDA plots are NOT listed here
+# (there is no fixed set -- one per method/coloring variant); relocate_all_runs
+# globs runs/<id>/dim_reduction_*.png instead.
 _ALWAYS_KEEP = ("data.csv", "predictions.csv", "manifest.json")
 
 # Manifest fields that hold a path to a product file. On relocate these are
@@ -39,7 +41,8 @@ _ALWAYS_KEEP = ("data.csv", "predictions.csv", "manifest.json")
 # files. features_path is deliberately NOT rewritten -- features.npz is an
 # intermediate that's discarded, so the field is left pointing at the (now-gone)
 # runs/ path rather than at a nonexistent recent_work file.
-_PATH_FIELDS = ("csv_path", "featurizer_path", "model_path", "mlp_prep_path")
+_PATH_FIELDS = ("csv_path", "featurizer_path", "model_path", "mlp_prep_path",
+                "plot_path")
 
 
 def recent_work_path(run_id: str | None = None) -> str:
@@ -118,6 +121,15 @@ def relocate_all_runs(runs_root: str = RUNS_DIR) -> list[str]:
         # mlp_prep_path, which we add explicitly; _KEEP_BY_MODEL covers the
         # type's other known files (featurizer.pkl etc.).
         keep = set(_ALWAYS_KEEP)
+        # EDA produces one PNG per method/coloring variant (e.g.
+        # dim_reduction_pca_target.png, dim_reduction_tsne_classes3.png), so
+        # keep every dim_reduction_*.png present rather than a fixed list.
+        try:
+            for fn in os.listdir(run_path):
+                if fn.startswith("dim_reduction_") and fn.endswith(".png"):
+                    keep.add(fn)
+        except OSError:
+            pass
         types = set(data.get("models", {}).keys())
         if model_type:
             types.add(model_type)
@@ -167,6 +179,12 @@ def relocate_all_runs(runs_root: str = RUNS_DIR) -> list[str]:
 
                 _rewrite(data)
                 for rec in data.get("models", {}).values():
+                    if isinstance(rec, dict):
+                        _rewrite(rec)
+                # EDA plots: each method's record carries a plot_path that
+                # points at the (now-deleted) runs/<id>/ copy; rewrite it to the
+                # recent_work/<id>/ copy so the saved manifest stays resolvable.
+                for rec in data.get("eda", {}).values():
                     if isinstance(rec, dict):
                         _rewrite(rec)
                 with open(mdest, "w") as fh:

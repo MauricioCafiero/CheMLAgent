@@ -77,6 +77,8 @@ __all__ = [
     "run_inference_mlp",
     "train_chemprop",
     "run_inference_chemprop",
+    "dimension_reduction",
+    "mlp_scan",
 ]
 
 _MANIFEST = "manifest.json"
@@ -780,6 +782,379 @@ def grid_search(
     }
 
 
+# --- MLP hyperparameter scan (5-fold CV) -----------------------------------
+#
+# mlp_scan is the neural-net counterpart to grid_search: it sweeps a SMALL grid
+# of MLP architecture / optimizer hyperparameters with k-fold cross-validation
+# on the TRAIN split, refits the best combination on the full train set,
+# evaluates on the held-out test split, and saves the result exactly like
+# train_mlp (model_mlp.pt + mlp_prep.npz + mlp_arch in the manifest) so
+# evaluate_model(run_id, 'mlp') / run_inference_mlp work unchanged on the result.
+#
+# Adapted from big_datasets/scripts/mlp_grid_scan.py (branch origin/linux-bigdata),
+# which scans neurons x num_hidden_layers x lr x weight_decay x pca_var against
+# the single train/test split. The differences here: bounded grid (<=6 combos,
+# for the LLM-driven agent), k-fold CV for model selection (the script used the
+# held-out test split directly -- mildly leaky), and the best model is saved as
+# a runnable artifact (the script only wrote a CSV). epochs is deliberately NOT
+# searched: a decent max + early stopping (patience/min_delta) already handles
+# it, per the project's grid-search plan.
+
+# Tunable hyperparameters exposed to the scan. Anything outside this set is
+# rejected. skip_connection is fixed True (the tuned config) and not searched.
+_MLP_SCAN_PARAMS: set[str] = {
+    "neurons", "num_hidden_layers", "lr", "weight_decay", "pca_var"}
+
+# Defaults for params the caller omits (so a partial grid scans a subset and
+# leaves the rest at the tuned train_mlp values). Mirrors train_mlp's config.
+_MLP_SCAN_DEFAULTS: dict[str, object] = {
+    "neurons": 250, "num_hidden_layers": 1, "lr": 2e-3,
+    "weight_decay": 0.2, "pca_var": 0.95,
+}
+
+# Fixed iteration order so the grid product is deterministic across calls.
+_MLP_SCAN_KEY_ORDER = ("neurons", "num_hidden_layers", "lr",
+                      "weight_decay", "pca_var")
+
+
+def _validate_mlp_grid(
+        param_grid: dict[str, list]) -> tuple[dict[str, list], int]:
+    """Coerce + validate an MLP scan grid. Returns (clean_grid, n_combos).
+
+    Same caps as grid_search: at most 3 values per hyperparameter and at most
+    6 combinations total. Allowed keys: neurons, num_hidden_layers, lr,
+    weight_decay, pca_var. Omitted keys are filled from _MLP_SCAN_DEFAULTS
+    (each counting as one value, i.e. fixed across the scan), so a partial grid
+    like {'neurons':[64,250], 'lr':[2e-3,8e-3]} is a 2x2 = 4-combo scan.
+    """
+    if not isinstance(param_grid, dict) or not param_grid:
+        raise ValueError(
+            "param_grid must be a non-empty dict of hyperparameter -> list of "
+            "values, e.g. {'neurons': [64, 250], 'lr': [2e-3, 8e-3]}.")
+    unknown = set(param_grid) - _MLP_SCAN_PARAMS
+    if unknown:
+        raise ValueError(
+            f"Unknown hyperparameter(s) for MLP scan: {sorted(unknown)}. "
+            f"Allowed: {sorted(_MLP_SCAN_PARAMS)}.")
+    clean: dict[str, list] = {}
+    n_combos = 1
+    for key, vals in param_grid.items():
+        values = list(vals)
+        if len(values) < 2:
+            raise ValueError(
+                f"{key}: a scan needs at least 2 values to compare, "
+                f"got {len(values)}.")
+        if len(values) > _GRID_MAX_VALUES_PER_PARAM:
+            raise ValueError(
+                f"{key}: at most {_GRID_MAX_VALUES_PER_PARAM} values per "
+                f"hyperparameter, got {len(values)}.")
+        if key in ("neurons", "num_hidden_layers"):
+            values = [int(v) for v in values]
+        else:  # lr, weight_decay, pca_var
+            values = [float(v) for v in values]
+        n_combos *= len(values)
+        clean[key] = values
+    if n_combos > _GRID_MAX_COMBINATIONS:
+        raise ValueError(
+            f"param_grid expands to {n_combos} combinations; the limit is "
+            f"{_GRID_MAX_COMBINATIONS} total. Drop a value or a hyperparameter.")
+    return clean, n_combos
+
+
+def _mlp_train_once(X_train, y_train, X_val, y_val, combo: dict,
+                    batch_size: int, epochs: int, patience: int,
+                    min_delta: float, rd_abs: str) -> dict:
+    """Train one MLP for one hyperparameter combo and score it on (X_val, y_val).
+
+    Mirrors the per-combo block in big_datasets/scripts/mlp_grid_scan.py:
+    prep_data (aggressive clean -> standardize -> PCA(combo['pca_var'])) fit on
+    X_train, MLP_Model(neurons, num_hidden_layers, skip_connection=True), SGD(
+    lr, weight_decay) + MSE + early stopping (patience/min_delta), then
+    evaluate_regression for train/val r2. SGD divergence (loss -> NaN, most
+    often at high lr) is caught and reported as diverged=True rather than
+    crashing the scan. Runs from rd_abs so MLP_Model's params file lands in the
+    run dir, not the project root. Returns the trained model + fitted prep so
+    the caller can either keep them (the final refit) or discard them (CV folds).
+    """
+    import torch
+    import torch.nn as nn
+    import matplotlib
+    matplotlib.use("Agg")  # evaluate_regression plots; never pop a GUI window
+    import matplotlib.pyplot as plt
+    from chemlagent.pytorch_mlp import (
+        MLP_Model, prep_data, train, evaluate_regression)
+
+    cwd = os.getcwd()
+    os.chdir(os.path.abspath(rd_abs))
+    model = prep = None
+    val_r2 = train_r2 = float("nan")
+    input_dims = None
+    epochs_run = 0
+    diverged = False
+    try:
+        prep = prep_data(batch_size=batch_size, shuffle=True,
+                         reduce_dim="pca", pca_var=combo["pca_var"])
+        _, _, train_loader, _ = prep.create_data_loader(
+            X_train, y_train, X_val, y_val)
+        input_dims = int(prep.X_train.shape[1])
+        model = MLP_Model(neurons=combo["neurons"], input_dims=input_dims,
+                          num_hidden_layers=combo["num_hidden_layers"],
+                          skip_connection=True)
+        loss_fn = nn.MSELoss()
+        opt = torch.optim.SGD(model.parameters(), lr=combo["lr"],
+                              weight_decay=combo["weight_decay"])
+        best_loss = float("inf")
+        stale = 0
+        for epoch in range(epochs):
+            epochs_run = epoch + 1
+            epoch_loss = train(train_loader, model, loss_fn, opt)
+            if not np.isfinite(epoch_loss):
+                diverged = True
+                break
+            if epoch_loss < best_loss - min_delta:
+                best_loss = epoch_loss
+                stale = 0
+            else:
+                stale += 1
+                if stale >= patience:
+                    break
+        if not diverged:
+            train_r2, val_r2 = evaluate_regression(
+                prep.X_train, np.asarray(y_train, dtype=float),
+                prep.X_test, np.asarray(y_val, dtype=float), model)
+            if not np.isfinite(val_r2):
+                diverged = True
+                val_r2 = float("nan")
+        plt.close("all")
+    except Exception as exc:
+        diverged = True
+        if print_flag:
+            print(f"  [diverged] {combo}: {exc!r}")
+    finally:
+        os.chdir(cwd)
+    return {"model": model, "prep": prep, "val_r2": float(val_r2),
+            "train_r2": float(train_r2), "input_dims": input_dims,
+            "epochs_run": int(epochs_run), "diverged": bool(diverged)}
+
+
+def _mlp_cv(combo: dict, X_train, y_train, cv: int, batch_size: int,
+            epochs: int, patience: int, min_delta: float, rd_abs: str
+            ) -> tuple[float, int]:
+    """k-fold CV for one combo. Returns (mean_val_r2, n_diverged_folds).
+
+    Each fold fits prep_data on the fold-train, trains the MLP, and scores on
+    the held-out fold-val. A diverged fold (SGD NaN) contributes no r2 but is
+    counted; the combo's score is the mean over the non-diverged folds (NaN if
+    every fold diverged). Single-threaded (no worker fork) to avoid the Apple-
+    Silicon libomp double-load segfault (see memory torch-before-lightgbm).
+    """
+    from sklearn.model_selection import KFold
+    kf = KFold(n_splits=cv, shuffle=True, random_state=42)
+    val_r2s: list[float] = []
+    n_div = 0
+    for tr_idx, val_idx in kf.split(X_train):
+        res = _mlp_train_once(
+            X_train[tr_idx], y_train[tr_idx], X_train[val_idx],
+            y_train[val_idx], combo, batch_size, epochs, patience, min_delta,
+            rd_abs)
+        if res["diverged"] or not np.isfinite(res["val_r2"]):
+            n_div += 1
+        else:
+            val_r2s.append(res["val_r2"])
+        # Free the fold's model + prep so 30 CV trainings don't accumulate.
+        res["model"] = None
+        res["prep"] = None
+    mean_r2 = float(np.mean(val_r2s)) if val_r2s else float("nan")
+    return mean_r2, n_div
+
+
+def mlp_scan(
+    run_id: str,
+    param_grid: dict[str, list],
+    batch_size: int = 32,
+    epochs: int = 500,
+    patience: int = 75,
+    min_delta: float = 1e-5,
+    cv_folds: int = 5,
+) -> dict:
+    """Grid-scan MLP hyperparameters with k-fold CV and save the best fit.
+
+    Sweeps a SMALL grid of MLP architecture / optimizer hyperparameters with
+    k-fold (default 5-fold) cross-validation on the TRAIN split only (the
+    held-out test split in features.npz is never seen during selection), refits
+    the best combination on the full train set, evaluates on the held-out test
+    split, and saves the result exactly like train_mlp (model_mlp.pt +
+    mlp_prep.npz + mlp_arch in the manifest), so evaluate_model(run_id, 'mlp')
+    and run_inference_mlp work unchanged on the result.
+
+    The grid is capped to keep a tool call bounded: at most 3 values per
+    hyperparameter and at most 6 total combinations (a 3x3=9 grid is rejected).
+    With 5-fold CV that is at most 30 fold-trainings + 1 refit. Each training is
+    single-threaded (no worker fork) to avoid the Apple-Silicon libomp
+    double-load segfault. Omitted hyperparameters keep their tuned train_mlp
+    defaults (so a partial grid scans a subset).
+
+    Only the following are tunable; unknown ones are rejected:
+
+      - neurons: width of each hidden layer (default 250)
+      - num_hidden_layers: extra sigmoid hidden layers beyond the input layer
+        (default 1; 0 = input layer only)
+      - lr: SGD learning rate (default 2e-3)
+      - weight_decay: SGD weight decay (default 0.2)
+      - pca_var: PCA explained-variance fraction for input reduction
+        (default 0.95)
+
+    epochs is NOT searched: a decent max + early stopping (patience/min_delta)
+    already handles it. SGD divergence (loss -> NaN, typically at high lr) is
+    caught per fold and counted; a combination whose folds all diverge scores
+    NaN and cannot win. If every combination diverges, the call raises with a
+    hint to lower lr / weight_decay.
+
+    Use the SAME run_id as the preceding featurize_fingerprints call. This is
+    the PyTorch-MLP counterpart of grid_search (which covers random_forest /
+    lightgbm / svr).
+
+    Args:
+        run_id: Pipeline run identifier; reads features.npz, writes
+            mlp_model.pt, mlp_prep.npz, and updates manifest.json.
+        param_grid: dict of hyperparameter -> list of values to search. Emit
+            as a JSON object with JSON-array values, e.g.
+            {"neurons": [64, 250], "lr": [2e-3, 8e-3]}. At most 3 values per key
+            and 6 combinations total. Omitted keys keep their defaults.
+        batch_size: Training batch size (default 32), fixed across the scan.
+        epochs: Max training epochs per fit (default 500). Early stopping
+            (patience/min_delta) usually ends each fit well before this.
+        patience: Early stopping patience (default 75).
+        min_delta: Minimum epoch-loss decrease counted as improvement
+            (default 1e-5).
+        cv_folds: Number of CV folds for model selection (default 5). Shrunk
+            automatically for small train sets so each fold still has enough
+            rows.
+
+    Returns:
+        dict with keys: run_id, model_type ('mlp'), best_params (dict of the
+        winning hyperparameters), best_cv_r2 (mean CV r2 of the winner), r2,
+        r2_train (test/train r2 of the refit winner), n_combinations,
+        n_diverged_combos, cv_folds, epochs_run, model_path, manifest_path.
+    """
+    print("MLP scan tool")
+    print("=" * 55)
+    import itertools
+    import time
+    import torch
+
+    clean, n_combos = _validate_mlp_grid(param_grid)
+
+    feat_path = os.path.join(run_dir(run_id), _FEATURES)
+    if not os.path.exists(feat_path):
+        raise FileNotFoundError(
+            f"{feat_path} not found. Run featurize_fingerprints for run_id "
+            f"{run_id!r} first.")
+    feats = np.load(feat_path)
+    X_train = np.ascontiguousarray(feats["X_train"], dtype=np.float64)
+    X_test = np.ascontiguousarray(feats["X_test"], dtype=np.float64)
+    y_train = np.asarray(feats["y_train"], dtype=float)
+    y_test = np.asarray(feats["y_test"], dtype=float)
+
+    n_train = int(y_train.reshape(-1).shape[0])
+    cv = int(cv_folds)
+    while cv > 2 and n_train // cv < 5:
+        cv -= 1
+
+    # Full grid: scanned keys from clean, omitted keys fixed at their defaults.
+    grid = {k: clean.get(k, [_MLP_SCAN_DEFAULTS[k]]) for k in _MLP_SCAN_KEY_ORDER}
+    combos = [dict(zip(_MLP_SCAN_KEY_ORDER, vals))
+              for vals in itertools.product(*(grid[k] for k in _MLP_SCAN_KEY_ORDER))]
+
+    rd_abs = os.path.abspath(run_dir(run_id))
+    print(f"Scanning MLP over {n_combos} combination(s) "
+          f"({cv}-fold CV, {len(combos)} total fits).")
+
+    best = None  # {"combo", "mean_cv_r2", "n_diverged"}
+    n_diverged_combos = 0
+    t0 = time.time()
+    for idx, combo in enumerate(combos, 1):
+        mean_r2, n_div = _mlp_cv(
+            combo, X_train, y_train, cv, batch_size, epochs, patience,
+            min_delta, rd_abs)
+        finite = np.isfinite(mean_r2)
+        if not finite:
+            n_diverged_combos += 1
+        if finite and (best is None or mean_r2 > best["mean_cv_r2"]):
+            best = {"combo": combo, "mean_cv_r2": float(mean_r2),
+                    "n_diverged_folds": n_div}
+        if print_flag:
+            print(f"[{idx}/{len(combos)}] {combo} -> cv_r2="
+                  f"{mean_r2 if finite else float('nan'):.4f} "
+                  f"(diverged folds: {n_div}/{cv})")
+
+    if best is None:
+        raise ValueError(
+            f"All {n_combos} MLP combination(s) diverged during {cv}-fold CV "
+            f"(SGD loss -> NaN). Try a lower lr or smaller weight_decay in "
+            f"param_grid.")
+
+    # Refit the winning combo on the full train set and score on the held-out
+    # test split. This is the model saved as the run's 'mlp' artifact.
+    refit = _mlp_train_once(
+        X_train, y_train, X_test, y_test, best["combo"], batch_size, epochs,
+        patience, min_delta, rd_abs)
+    if refit["diverged"] or not np.isfinite(refit["val_r2"]):
+        raise ValueError(
+            f"Best-by-CV combination {best['combo']} diverged when refit on "
+            f"the full train set. Try a lower lr or smaller weight_decay.")
+
+    model, prep = refit["model"], refit["prep"]
+    input_dims = refit["input_dims"]
+    test_r2 = float(refit["val_r2"])
+    train_r2 = float(refit["train_r2"])
+    epochs_run = int(refit["epochs_run"])
+
+    model_path = os.path.join(run_dir(run_id), _MLP_MODEL)
+    torch.save(model.state_dict(), model_path)
+    prep_path = os.path.join(run_dir(run_id), _MLP_PREP)
+    prep.save_stats(prep_path)
+    # Free the refit model + prep (state_dict / stats are now on disk).
+    del model, prep
+
+    manifest_path = _record_model(
+        run_id, "mlp", model_path,
+        mlp_prep_path=prep_path,
+        mlp_arch={"neurons": best["combo"]["neurons"],
+                  "input_dims": input_dims,
+                  "num_hidden_layers": best["combo"]["num_hidden_layers"],
+                  "skip_connection": True},
+        r2=test_r2,
+        r2_train=train_r2,
+        epochs_run=epochs_run,
+        mlp_scan=True,
+        best_params=best["combo"],
+        best_cv_r2=float(best["mean_cv_r2"]),
+        n_grid_combinations=int(n_combos),
+        cv_folds=int(cv),
+        n_diverged_combos=int(n_diverged_combos))
+    publish_products(run_id, run_dir(run_id), _MLP_MODEL, _MLP_PREP, _MANIFEST)
+
+    if print_flag:
+        print(f"Best params: {best['combo']}  (best_cv_r2="
+              f"{best['mean_cv_r2']:.4f}, refit test r2={test_r2:.4f})")
+
+    return {
+        "run_id": run_id,
+        "model_type": "mlp",
+        "best_params": best["combo"],
+        "best_cv_r2": float(best["mean_cv_r2"]),
+        "r2": test_r2,
+        "r2_train": train_r2,
+        "n_combinations": int(n_combos),
+        "n_diverged_combos": int(n_diverged_combos),
+        "cv_folds": int(cv),
+        "epochs_run": epochs_run,
+        "model_path": model_path,
+        "manifest_path": manifest_path,
+    }
+
+
 def evaluate_model(run_id: str, model_type: str | None = None) -> dict:
     """Evaluate a saved model on the held-out test split.
 
@@ -1379,4 +1754,301 @@ def run_inference_chemprop(run_id: str, smiles_list: list[str],
         "smiles": list(smiles_list),
         "predictions": preds.tolist(),
         "predictions_csv": pred_path,
+    }
+
+
+# --- EDA: dimension reduction + visualization -----------------------------
+#
+# dimension_reduction is the exploratory step: after featurize_fingerprints it
+# reads features.npz, standardizes the combined train+test features, optionally
+# drops multivariate outliers, projects to 2D (PCA or t-SNE), and saves a PNG
+# scatter colored by the target (continuous), by train/test split, or by
+# quantile-binned potency classes. It mirrors the CafChemEDA notebook's
+# dimreduction flow but is tool-shaped (returns JSON + a saved PNG, not an
+# interactive plt show) and is more robust: t-SNE is pre-reduced with PCA when
+# the raw feature space is high-dimensional (the sklearn-recommended pipeline),
+# perplexity is clamped to n_samples-1, and outlier removal is guarded so a
+# high-feature/low-sample run degrades gracefully instead of crashing.
+
+_DR_METHODS = ("pca", "tsne")
+_DR_COLOR_BY = ("target", "split", "classes")
+
+
+def _elliptic_outliers(X, contamination):
+    """Fit EllipticEnvelope on X, return a boolean inlier mask.
+
+    For high-dimensional feature spaces (fingerprints/Mordred, 1000+ columns)
+    EllipticEnvelope's MCD robust-covariance estimate is impractically slow
+    AND rank-deficient -- molecular fingerprints are sparse and collinear, so
+    the covariance is not full rank and sklearn warns/errors. The CafChemEDA
+    notebook only ever ran this on 217-dim RDKit descriptors, where it was
+    fine; it does not scale to fingerprint widths.
+
+    So when n_features > 50 we first project to a <=50-component PCA subspace
+    (randomized SVD, fast) and run MCD there: the PCA components are orthogonal
+    (full rank -> no rank warning), and MCD on 50 dims is seconds, not minutes.
+    Outlier labels are computed in that subspace and returned as a row mask on
+    the original X. The reduction is unsupervised and uses no target, so it
+    leaks nothing.
+
+    Guarded: on any remaining failure return all-True (no rows dropped) so the
+    EDA plot still renders. MCD's slogdet can also emit numpy linalg
+    RuntimeWarnings on near-singular covariance; those are expected and silenced
+    here, as is sklearn's "not full rank" UserWarning, so tool output stays clean.
+    """
+    import warnings
+    from sklearn.covariance import EllipticEnvelope
+    from sklearn.decomposition import PCA
+
+    n_samples, n_features = X.shape
+    Xd = X
+    if n_features > 50:
+        n_pre = max(2, min(50, n_samples - 1, n_features - 1))
+        try:
+            with warnings.catch_warnings():
+                warnings.filterwarnings("ignore", category=RuntimeWarning)
+                Xd = PCA(n_components=n_pre, svd_solver="randomized",
+                          random_state=42).fit_transform(X)
+        except Exception:
+            Xd = X  # fall back to raw; the fit guard below handles failure
+        if print_flag:
+            print(f"Outlier detection in PCA-reduced {Xd.shape[1]}-dim space "
+                  f"(from {n_features}).")
+
+    try:
+        with warnings.catch_warnings():
+            warnings.filterwarnings("ignore", category=RuntimeWarning)
+            warnings.filterwarnings(
+                "ignore", message=".*not full rank.*", category=UserWarning)
+            det = EllipticEnvelope(contamination=contamination,
+                                    support_fraction=None)
+            det.fit(Xd)
+            return det.predict(Xd) == 1
+    except Exception as exc:
+        if print_flag:
+            print(f"Outlier detection skipped ({exc!r}); keeping all rows.")
+        return np.ones(X.shape[0], dtype=bool)
+
+
+def dimension_reduction(
+    run_id: str,
+    method: str = "pca",
+    color_by: str = "target",
+    num_classes: int = 3,
+    remove_outliers: bool = True,
+    outlier_contamination: float = 0.01,
+    perplexity: int = 30,
+) -> dict:
+    """Reduce the featurized dataset to 2D and save an EDA scatter plot.
+
+    Reads runs/<run_id>/features.npz (the train/test split from
+    featurize_fingerprints), standardizes the combined features, optionally
+    drops multivariate outliers (EllipticEnvelope), projects to 2 dimensions
+    with PCA or t-SNE, and saves a PNG scatter plot under runs/<run_id>/.
+    Use this as the exploratory step to see whether the feature space separates
+    potency classes or clusters by scaffold, before or after training.
+
+    This reuses the SAME featurization as train_model (features.npz), so call
+    featurize_fingerprints first with the SAME run_id. It is unsupervised --
+    train and test points are combined for the projection -- so it does not
+    leak the test target into anything model-facing.
+
+    Robustness improvements over a plain PCA/t-SNE scatter:
+      - t-SNE is run on a <=50-component PCA projection first when the raw
+        feature space is high-dimensional (the sklearn-recommended pipeline;
+        faster and more stable than t-SNE on 1000+ raw features).
+      - perplexity is clamped to n_samples-1 so small runs do not crash.
+      - outlier removal is dimension-aware: for high-dimensional feature
+        spaces (fingerprints/Mordred, 1000+ columns) EllipticEnvelope's MCD
+        robust covariance is run in a <=50-component PCA subspace, not the raw
+        space -- MCD on 2048-dim fingerprints is impractically slow and rank-
+        deficient. If the fit still fails it is skipped and reported.
+
+    Args:
+        run_id: Pipeline run identifier; reads features.npz + manifest.json,
+            writes dim_reduction_<method>.png and updates manifest.json.
+        method: 'pca' (default) or 'tsne'.
+        color_by: How to color points: 'target' (default, continuous color
+            gradient by the target value with a colorbar), 'split' (train vs
+            test), or 'classes' (target binned into num_classes quantile
+            classes, like the EDA notebook's make_classes).
+        num_classes: Number of quantile classes when color_by='classes'
+            (default 3). Ignored for other color_by values.
+        remove_outliers: Drop multivariate outliers (EllipticEnvelope) before
+            projecting (default True).
+        outlier_contamination: Expected outlier fraction for EllipticEnvelope
+            (default 0.01). Ignored when remove_outliers is False.
+        perplexity: t-SNE perplexity (default 30). Clamped to n_samples-1.
+            Ignored for method='pca'.
+
+    Returns:
+        dict with keys: run_id, method, color_by, n_points, n_outliers_removed,
+        explained_variance (list of 2 floats, PCA only; empty for t-SNE),
+        kl_divergence (float, t-SNE only; NaN for PCA), plot_path,
+        manifest_path.
+    """
+    print("Dimension reduction (EDA) tool")
+    print("=" * 55)
+
+    method = method.lower()
+    if method not in _DR_METHODS:
+        raise ValueError(
+            f"Unknown method {method!r}. Use 'pca' or 'tsne'.")
+    color_by = color_by.lower()
+    if color_by not in _DR_COLOR_BY:
+        raise ValueError(
+            f"Unknown color_by {color_by!r}. Use 'target', 'split', or "
+            f"'classes'.")
+
+    feat_path = os.path.join(run_dir(run_id), _FEATURES)
+    if not os.path.exists(feat_path):
+        raise FileNotFoundError(
+            f"{feat_path} not found. Run featurize_fingerprints for run_id "
+            f"{run_id!r} first.")
+    feats = np.load(feat_path)
+    X = np.vstack([feats["X_train"], feats["X_test"]]).astype(np.float64)
+    y = np.concatenate([feats["y_train"], feats["y_test"]]).astype(float)
+    n_train = int(feats["X_train"].shape[0])
+    split = np.concatenate([np.zeros(n_train, dtype=int),
+                            np.ones(len(y) - n_train, dtype=int)])
+
+    # Replace non-finite values (NaN/inf from some descriptor featurizers)
+    # before scaling so StandardScaler / the projectors do not see them.
+    X = np.where(np.isfinite(X), X, 0.0)
+
+    from sklearn.preprocessing import StandardScaler
+    X = StandardScaler().fit_transform(X)
+
+    n_outliers = 0
+    if remove_outliers:
+        inliers = _elliptic_outliers(X, outlier_contamination)
+        n_outliers = int((~inliers).sum())
+        X, y, split = X[inliers], y[inliers], split[inliers]
+    if print_flag:
+        print(f"Combined features: {X.shape}; removed {n_outliers} outliers.")
+
+    n_samples, n_features = X.shape
+
+    if method == "pca":
+        from sklearn.decomposition import PCA
+        proj = PCA(n_components=2, random_state=42)
+        Z = proj.fit_transform(X)
+        explained_variance = [float(v) for v in proj.explained_variance_ratio_]
+        kl_divergence = float("nan")
+        subtitle = (f"PCA · explained var = {explained_variance[0]:.3f}, "
+                    f"{explained_variance[1]:.3f}")
+    else:  # tsne
+        from sklearn.decomposition import PCA
+        from sklearn.manifold import TSNE
+        # Pre-reduce with PCA when the raw space is high-dimensional: t-SNE
+        # on 1000+ features is slow and poorly behaved. 50 comps is the common
+        # heuristic; clamp to n_samples-1 and n_features-1 for tiny runs.
+        if n_features > 50:
+            n_pre = max(2, min(50, n_samples - 1, n_features - 1))
+            X = PCA(n_components=n_pre, random_state=42).fit_transform(X)
+            if print_flag:
+                print(f"t-SNE pre-reduced to {n_pre} PCA components.")
+        perp = int(min(perplexity, max(1, n_samples - 1)))
+        tsne = TSNE(n_components=2, perplexity=perp, random_state=42,
+                    init="pca", learning_rate="auto")
+        Z = tsne.fit_transform(X)
+        explained_variance = []
+        kl_divergence = float(tsne.kl_divergence_)
+        subtitle = f"t-SNE · perplexity = {perp} · KL = {kl_divergence:.4f}"
+
+    # --- plot --------------------------------------------------------------
+    import matplotlib
+    matplotlib.use("Agg")  # non-interactive CLI; never pop a GUI window
+    import matplotlib.pyplot as plt
+    from matplotlib.colors import ListedColormap
+
+    manifest = _read_manifest(run_id) if os.path.exists(
+        _manifest_path(run_id)) else {}
+    units = manifest.get("target_units") or ""
+    log_t = manifest.get("log_transformed", False)
+    cbar_label = "target"
+    if units:
+        cbar_label = f"target ({units})"
+    if log_t:
+        cbar_label = f"log10 {cbar_label}"
+
+    fig, ax = plt.subplots(figsize=(8, 8))
+    if color_by == "target":
+        sc = ax.scatter(Z[:, 0], Z[:, 1], c=y, cmap="viridis", s=18,
+                        edgecolors="none", alpha=0.85)
+        cbar = fig.colorbar(sc, ax=ax, fraction=0.046, pad=0.04)
+        cbar.set_label(cbar_label)
+    elif color_by == "split":
+        cmap = ListedColormap(["#1f77b4", "#d62728"])
+        sc = ax.scatter(Z[:, 0], Z[:, 1], c=split, cmap=cmap, s=18,
+                        edgecolors="none", alpha=0.85)
+        ax.legend(handles=sc.legend_elements()[0], labels=["train", "test"],
+                  title="split")
+    else:  # classes -- quantile-bin the continuous target
+        nc = max(2, int(num_classes))
+        qs = np.linspace(0, 1, nc + 1)
+        edges = np.quantile(y, qs)
+        # Open the first/last edges so every point lands in a bin.
+        edges[0], edges[-1] = -np.inf, np.inf
+        codes = np.searchsorted(edges[1:-1], y, side="right")
+        cmap = plt.get_cmap("tab10", nc)
+        sc = ax.scatter(Z[:, 0], Z[:, 1], c=codes, cmap=cmap, s=18,
+                        edgecolors="none", alpha=0.85)
+        handles, _ = sc.legend_elements()
+        labels = []
+        for i in range(nc):
+            lo, hi = edges[i], edges[i + 1]
+            lo = y.min() if not np.isfinite(lo) else lo
+            hi = y.max() if not np.isfinite(hi) else hi
+            labels.append(f"{lo:.3g} ≤ {cbar_label} < {hi:.3g}")
+        ax.legend(handles, labels, title=f"{nc} classes", fontsize=8)
+
+    ax.set_xlabel(f"{method.upper()} 1")
+    ax.set_ylabel(f"{method.upper()} 2")
+    ax.set_title(f"{run_id} · {method.upper()} 2D projection\n{subtitle}",
+                fontsize=10)
+    fig.tight_layout()
+
+    # Each projection gets its own file keyed by method + the fingerprint type
+    # it was built from, so re-featurizing the same run_id with a different
+    # fp_type (the "compare fingerprints" workflow) does NOT clobber the prior
+    # plot. color_by is a view of the same projection, not a separate result,
+    # so it is NOT in the filename -- re-coloring overwrites the same file (the
+    # latest coloring wins), and the color_by used is recorded in the manifest
+    # entry.
+    fp_type = manifest.get("fp_type") or "features"
+    variant = f"{method}_{fp_type}"
+    plot_path = os.path.join(run_dir(run_id), f"dim_reduction_{variant}.png")
+    fig.savefig(plot_path, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+
+    publish_products(run_id, run_dir(run_id), os.path.basename(plot_path),
+                     _MANIFEST)
+
+    manifest = _read_manifest(run_id) if os.path.exists(
+        _manifest_path(run_id)) else {}
+    eda = manifest.setdefault("eda", {})
+    eda[variant] = {
+        "method": method,
+        "fp_type": fp_type,
+        "color_by": color_by,
+        "n_points": int(n_samples),
+        "n_outliers_removed": int(n_outliers),
+        "explained_variance": explained_variance,
+        "kl_divergence": kl_divergence,
+        "plot_path": plot_path,
+    }
+    manifest_path = _write_manifest(run_id, manifest)
+
+    return {
+        "run_id": run_id,
+        "method": method,
+        "color_by": color_by,
+        "variant": variant,
+        "n_points": int(n_samples),
+        "n_outliers_removed": int(n_outliers),
+        "explained_variance": explained_variance,
+        "kl_divergence": kl_divergence,
+        "plot_path": plot_path,
+        "manifest_path": manifest_path,
     }

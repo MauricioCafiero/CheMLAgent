@@ -26,9 +26,18 @@ prepare_chembl_csv  ──►  featurize_fingerprints  ──►  train_model   
                                                    ──►  grid_search        ──►  run_inference(_mlp/_chemprop)
                                                        (5-fold CV over a          (small hyperparameter grid,
                                                         same run_id)               refits + saves best)
+                                                   ──►  mlp_scan
+                                                       (5-fold-CV scan over a
+                                                        SMALL MLP hyperparameter
+                                                        grid; refits + saves best)
                                                    ──►  train_mlp
                                                    ──►  train_chemprop
                                                         (MPNN on mol graphs)
+
+featurize_fingerprints  ──►  dimension_reduction   (optional EDA)
+                              (PCA / t-SNE 2D projection
+                               + scatter plot of the
+                               featurized matrix)
 ```
 
 The discovery tools are optional — use them when the request gives a protein
@@ -69,8 +78,13 @@ currently inactive — see [CheMeleon foundation model](#chemeleon-foundation-mo
   Murcko-scaffold train/test split. 2D types run on the molecular graph; 3D
   types generate conformers first. Pass `fp_type` (case-insensitive) to
   `featurize_fingerprints`.
-
-  | `fp_type`        | family       | description                                            |
+- **EDA / dimension reduction** — after featurizing, `dimension_reduction`
+  projects the featurized matrix to 2D with PCA or t-SNE (optionally dropping
+  MCD robust-covariance outliers first — PCA-reduced to ≤50 components on
+  high-dim fingerprints so it stays fast) and saves a scatter plot
+  (`dim_reduction_<method>_<fp_type>.png`), colored by target value, train/test
+  split, or target-derived class. Different fingerprints produce different
+  files (keyed by method + fp_type); recoloring overwrites the same projection.
   |------------------|--------------|--------------------------------------------------------|
   | `ECFP`           | fingerprint  | Morgan/ECFP circular fingerprint (counted)             |
   | `Atom_Pair`      | fingerprint  | topological atom-pair fingerprint                       |
@@ -97,6 +111,7 @@ currently inactive — see [CheMeleon foundation model](#chemeleon-foundation-mo
   | `train_model`     | LightGBM                       | fingerprints/descriptors | `model_type=lightgbm`                               |
   | `train_model`     | SVR                            | fingerprints/descriptors | `model_type=svr`, literature-tuned poly kernel     |
   | `grid_search`     | RF / LightGBM / SVR            | fingerprints/descriptors | 5-fold CV over a small grid; refits + saves best (see below) |
+  | `mlp_scan`        | PyTorch wide-and-deep MLP      | fingerprints      | 5-fold-CV scan over a SMALL grid; refits + saves best (see below) |
   | `train_mlp`       | PyTorch wide-and-deep MLP      | fingerprints      | SGD/lr/weight-decay/batch tuned internally             |
   | `train_chemprop`  | Chemprop MPNN                  | molecular graphs  | from-scratch MPNN only (CheMeleon foundation wired but inactive — see below) |
 - **Evaluate & infer** — metrics on the held-out split; predictions for new
@@ -213,6 +228,8 @@ that doubles as the Ollama tool schema.
 | `featurize_fingerprints` | `fp_type` (default `ECFP`), `test_size`                   |
 | `train_model`            | `model_type` (`random_forest`/`lightgbm`/`svr`), `n_estimators` |
 | `grid_search`            | `model_type`, `param_grid` (dict; capped at 3 values/param, 6 combos total) |
+| `mlp_scan`               | `param_grid` (dict; capped at 3 values/param, 6 combos total), `cv_folds` (default 5) |
+| `dimension_reduction`    | `method` (`pca`/`tsne`), `color_by` (`target`/`split`/`classes`), `num_classes`, `remove_outliers` |
 | `evaluate_model`         | —                                                         |
 | `run_inference`          | `smiles_list`                                             |
 | `train_mlp`              | `epochs` (default 2500, the tuned value)                  |
@@ -234,7 +251,20 @@ the Apple-Silicon libomp double-load segfault, and only whitelisted params are
 accepted: `random_forest` {n_estimators, max_depth, min_samples_leaf,
 max_features}, `lightgbm` {n_estimators, num_leaves, learning_rate,
 min_child_samples}, `svr` {C, gamma, epsilon} (the poly kernel's degree=2 /
-coef0=7 stay fixed). MLP and chemprop are not yet supported by `grid_search`.
+coef0=7 stay fixed). Chemprop is not yet covered by any scan tool.
+
+`mlp_scan` is the MLP counterpart: it exposes a bounded grid of MLP
+hyperparameters (`neurons`, `num_hidden_layers`, `lr`, `weight_decay`,
+`pca_var`; `epochs` is deliberately NOT searched — a decent max + early
+stopping already handles it). It runs 5-fold CV on the **train split only**,
+refits the best combination on the full train set, scores on the held-out test
+split, and saves `model_mlp.pt` + `mlp_prep.npz` + `mlp_arch` exactly like
+`train_mlp`, so `evaluate_model(run_id, 'mlp')` / `run_inference_mlp` work
+unchanged. Same caps as `grid_search` (3 values/param, 6 combos total),
+single-threaded, and omitted params fall back to tuned defaults (neurons 250,
+1 hidden layer, lr 2e-3, weight_decay 0.2, pca_var 0.95) — so a partial grid
+scans a subset. If every combination's SGD diverges, it raises with a hint to
+lower `lr` / `weight_decay`.
 
 ### CheMeleon foundation model
 
@@ -305,7 +335,7 @@ rewritten at quit.
 ```
 src/chemlagent/
   agent.py              Ollama dispatch loop + CLI
-  tools.py              the 12 Ollama-callable tool functions (3 discovery + 9 pipeline)
+  tools.py              the 15 Ollama-callable tool functions (3 discovery + 12 pipeline)
   data.py               CSV prep (local + ChEMBL), column/log autodetect
   fingerprints.py       scikit-fingerprints wrappers + scaffold split
   models.py             RF / LightGBM / SVR + evaluate
@@ -327,6 +357,9 @@ uv run pytest
 
 `test_smoke.py` exercises `prepare → featurize → train (RF) → evaluate` on
 synthetic data, so the tools are verifiable without hitting Ollama.
+`test_grid_search.py`, `test_mlp_scan.py`, and `test_dimension_reduction.py`
+cover the bounded-CV scan tools and the EDA projection tool respectively;
+`test_multi_model.py` covers the multi-model run plumbing.
 
 ## Notes
 
@@ -334,8 +367,9 @@ synthetic data, so the tools are verifiable without hitting Ollama.
   before `chemlagent.fingerprints`/`chemlagent.models`. On Apple Silicon both
   torch and lightgbm bundle OpenMP; if lightgbm's loads first, torch ops
   segfault. Don't reorder those imports.
-- No grid search is exposed (per scope); pass explicit hyperparameters or rely
-  on the tuned defaults.
+- Hyperparameter scans are bounded for the LLM-driven agent: `grid_search`
+  (RF/LightGBM/SVR) and `mlp_scan` (MLP) cap at 3 values per hyperparameter and
+  6 combinations total, single-threaded. chemprop MPNN is not yet covered.
 - `CLAUDE.md` holds the original project brief / agent instructions.
 
 ## Acknowledgments

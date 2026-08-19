@@ -63,6 +63,8 @@ TOOLS = [
     T.run_inference_mlp,
     T.train_chemprop,
     T.run_inference_chemprop,
+    T.dimension_reduction,
+    T.mlp_scan,
 ]
 
 AVAILABLE_FUNCTIONS = {fn.__name__: fn for fn in TOOLS}
@@ -94,7 +96,7 @@ target name or a short label). SMILES/target columns and whether to \
 log-transform the target are autodetected.
 2. featurize_fingerprints — featurize the dataset with a fingerprint type \
 (e.g. ECFP, Mordred, PubChem, MACCS) and scaffold-split it. Required before \
-train_model / train_mlp. Use the SAME run_id.
+train_model / train_mlp / dimension_reduction. Use the SAME run_id.
 3. Train ONE model on that run (same run_id):
    - train_model — random_forest, lightgbm, or svr (on the fingerprints).
    - train_mlp — PyTorch MLP (on the fingerprints).
@@ -109,6 +111,12 @@ random_forest {{n_estimators, max_depth, min_samples_leaf, max_features}}, \
 lightgbm {{n_estimators, num_leaves, learning_rate, min_child_samples}}, \
 svr {{C, gamma, epsilon}}. Use it when the user asks to tune or optimize, or \
 when a plain train_model r2 is poor; otherwise train_model is enough.
+   - mlp_scan — optional: 5-fold-CV scan over a SMALL grid of MLP \
+hyperparameters (neurons, num_hidden_layers, lr, weight_decay, pca_var; caps: \
+3 values per hyperparameter, 6 combos total), then saves the best fit like \
+train_mlp. epochs is NOT searched (early stopping handles it); SGD divergence \
+is caught per fold. Use it when the user asks to tune/optimize the MLP, or when \
+a plain train_mlp r2 is poor.
 4. evaluate_model — evaluate a saved model on the held-out test split (not \
 used for chemprop, which reports test metrics at train time). A run can hold \
 several trained models (one per type); by default the active model is scored, \
@@ -120,6 +128,17 @@ trained model stays reachable (its own file + a per-type manifest record).
 target for new SMILES using the trained model. Use the SAME run_id. \
 Predictions come back in original units (e.g. IC50 nM or nm) with any log \
 transform inverted automatically.
+6. dimension_reduction — optional exploratory (EDA) step, available any time \
+after featurize_fingerprints (same run_id). Projects the featurized dataset to \
+2D with PCA or t-SNE and saves a PNG scatter plot (runs/<run_id>/\
+dim_reduction_<method>_<fp_type>.png) colored by the target value ('target', \
+default), the train/test split ('split'), or quantile-binned potency classes \
+('classes'). Each method+fingerprint combination gets its own file, so \
+re-featurizing with a different fp_type does not overwrite a prior plot; \
+re-coloring the same projection rewrites the same file (latest coloring \
+wins). Use it to eyeball whether the feature space separates potency \
+classes or clusters by scaffold, before or after training. No effect on the \
+model.
 
 Always reuse the same run_id across the stages of one task. Report metrics \
 (R^2, MAE) clearly to the user, and explain in plain terms what was built. \
@@ -430,7 +449,8 @@ def main(argv=None) -> int:
         f"[bold cyan]{_BANNER_LOGO.lstrip(chr(10))}[/bold cyan]\n\n"
         "[bold magenta]An Ollama-driven chemistry ML assistant.[/bold magenta]\n"
         "[dim]Prepare a ChEMBL/local CSV · featurize SMILES · train a model · "
-        "evaluate · run inference.[/dim]\n\n"
+        "grid search · evaluate · run inference.[/dim]\n\n"
+        "[bold yellow]A CafChem Project[/bold yellow]\n\n"
         "[bold]Keywords:[/bold] [cyan]/models[/cyan] [dim]list + load a run[/dim] · "
         "[cyan]/predict[/cyan] [dim]infer with loaded model (SMILES or --csv)[/dim] · "
         "[cyan]/help[/cyan] · [cyan]quit[/cyan] [dim]exit[/dim]",
