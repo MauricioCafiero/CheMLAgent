@@ -85,21 +85,26 @@ currently inactive — see [CheMeleon foundation model](#chemeleon-foundation-mo
   (`dim_reduction_<method>_<fp_type>.png`), colored by target value, train/test
   split, or target-derived class. Different fingerprints produce different
   files (keyed by method + fp_type); recoloring overwrites the same projection.
-  |------------------|--------------|--------------------------------------------------------|
-  | `ECFP`           | fingerprint  | Morgan/ECFP circular fingerprint (counted)             |
-  | `Atom_Pair`      | fingerprint  | topological atom-pair fingerprint                       |
-  | `MACCS`          | fingerprint  | 166-bit MACCS structural keys                           |
-  | `PubChem`        | fingerprint  | PubChem 881-bit fingerprint                            |
-  | `Functional_Groups` | fingerprint | functional-group presence bits                       |
-  | `RDKitFingerprint` | fingerprint | RDKit path fingerprint                                 |
-  | `Mordred`        | descriptor   | Mordred 2D/3D descriptor set (NaNs imputed downstream) |
-  | `RDKit_2D`       | descriptor   | RDKit's native ~217 continuous 2D descriptors           |
-  | `EState`         | descriptor   | 79 Kier–Hall electrotopological-state descriptors      |
-  | `E3FP`           | 3D fingerprint | 3D fingerprint from generated conformers             |
-  | `Autocorr`       | 3D descriptor | 3D autocorrelation descriptors                        |
-  | `MORSE`          | 3D descriptor | 3D Molecule Representation of Structures based on Electron diffraction |
-  | `RDF`            | 3D descriptor | radial distribution function descriptors              |
-  | *(molecular graph)* | graph     | not an `fp_type` — `train_chemprop` builds the graph directly from `data.csv` (SMILES → atom/bond graph via chemprop) |
+
+  The `fp_type` values accepted by `featurize_fingerprints` (and thus by
+  `dimension_reduction`):
+
+  | fp_type            | kind           | description                                                                  |
+  |--------------------|----------------|------------------------------------------------------------------------------|
+  | `ECFP`             | fingerprint    | Morgan/ECFP circular fingerprint (counted)                                   |
+  | `Atom_Pair`        | fingerprint    | topological atom-pair fingerprint                                            |
+  | `MACCS`            | fingerprint    | 166-bit MACCS structural keys                                                |
+  | `PubChem`          | fingerprint    | PubChem 881-bit fingerprint                                                  |
+  | `Functional_Groups`| fingerprint    | functional-group presence bits                                               |
+  | `RDKitFingerprint` | fingerprint    | RDKit path fingerprint                                                       |
+  | `Mordred`          | descriptor     | Mordred 2D/3D descriptor set (NaNs imputed downstream)                       |
+  | `RDKit_2D`         | descriptor     | RDKit's native ~217 continuous 2D descriptors                                |
+  | `EState`           | descriptor     | 79 Kier–Hall electrotopological-state descriptors                            |
+  | `E3FP`             | 3D fingerprint | 3D fingerprint from generated conformers                                     |
+  | `Autocorr`         | 3D descriptor  | 3D autocorrelation descriptors                                               |
+  | `MORSE`            | 3D descriptor  | 3D Molecule Representation of Structures based on Electron diffraction      |
+  | `RDF`              | 3D descriptor  | radial distribution function descriptors                                     |
+  | *(molecular graph)*| graph          | not an `fp_type` — `train_chemprop` builds the graph directly from `data.csv` (SMILES → atom/bond graph via chemprop) |
 
 - **Train** — pick one model per run (same `run_id`). Fingerprint/descriptor
   models take the featurized matrix; Chemprop reads `data.csv` directly and
