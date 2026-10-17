@@ -31,6 +31,7 @@ from rich.table import Table
 from ollama import Client as ollama_client
 
 from chemlagent import tools as T
+from chemlagent import shell as shell_mod
 from chemlagent.markdown_render import to_unicode_markdown
 
 console = Console(width=80)
@@ -65,6 +66,7 @@ TOOLS = [
     T.run_inference_chemprop,
     T.dimension_reduction,
     T.mlp_scan,
+    shell_mod.shell,
 ]
 
 AVAILABLE_FUNCTIONS = {fn.__name__: fn for fn in TOOLS}
@@ -438,7 +440,8 @@ def main(argv=None) -> int:
     # debug/progress prints on this flag; tool banners always print. Default
     # False = tools are silent unless --print is given.
     from chemlagent import data, pytorch_mlp, models, fingerprints, chemprop_model
-    for mod in (T, data, pytorch_mlp, models, fingerprints, chemprop_model):
+    for mod in (T, data, pytorch_mlp, models, fingerprints, chemprop_model,
+                shell_mod):
         mod.print_flag = args.print
 
     model = args.model or DEFAULT_MODELS[1]

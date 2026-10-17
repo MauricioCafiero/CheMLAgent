@@ -241,6 +241,7 @@ that doubles as the Ollama tool schema.
 | `run_inference_mlp`      | `smiles_list`                                             |
 | `train_chemprop`         | `epochs` (default 30), `batch_size`, `accelerator`       |
 | `run_inference_chemprop` | `smiles_list`                                             |
+| `shell`                  | `command` — sandboxed cross-platform mini-shell (`pwd`, `cd`, `ls`, `mkdir`, `find`, `cat`, `head`, `tail`, `wc`, `grep`); lives in `src/chemlagent/shell.py`. Lets the agent discover existing CSVs and per-run artifacts (under `runs/` and `recent_work/`) before creating anything new. No real shell is spawned; access is jailed to the repo, and there is no `rm`/`mv`/`cp` |
 
 Arguments are deliberately minimal to keep tool calls well-formed. Hyperparameters
 that aren't exposed use tuned internal defaults (e.g. the SVR poly kernel, the
