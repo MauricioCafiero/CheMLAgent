@@ -1,10 +1,11 @@
 """Tests for the ``mlp_scan`` tool (5-fold-CV MLP hyperparameter scan).
 
-Mirrors tests/test_grid_search.py and test_multi_model.py: a synthetic
-features.npz whose target is a linear function of the features (so the MLP can
-fit, giving finite CV r2), run from a clean CWD under tmp_path so runs/ is
-isolated. The scan caps (<=3 values/param, <=6 combos) and the save/evaluate
-plumbing are the focus; neural-net convergence is not asserted beyond finite r2.
+Mirrors tests/test_grid_search.py and test_multi_model.py: the REAL pipeline
+(tests/conftest.py) prepares and featurizes a slice of the repo's ChEMBL CSV
+(ECFP, Murcko split) once per module; the module-scoped seeded_run fixture
+switches CWD to a per-module tmp dir so runs/ is isolated. The scan caps
+(<=3 values/param, <=6 combos) and the save/evaluate plumbing are the focus;
+neural-net convergence is not asserted beyond finite r2.
 """
 
 import os
@@ -13,31 +14,6 @@ import numpy as np
 import pytest
 
 from chemlagent import tools as T
-
-
-@pytest.fixture
-def seeded_run(tmp_path, monkeypatch):
-    """A run_id with synthetic features.npz + a seeded manifest.
-
-    Target is a linear function of the features so an MLP can fit well enough
-    for finite CV / test r2 (the asserts only require finite, not a threshold).
-    """
-    monkeypatch.chdir(tmp_path)
-    run_id = "mlpscan"
-    rng = np.random.default_rng(0)
-    n = 200
-    X = rng.normal(0, 1, size=(n, 20))
-    w = rng.normal(0, 1, size=20)
-    y = X @ w + 0.05 * rng.normal(size=n)
-    idx = rng.permutation(n)
-    n_tr = 160
-    Xtr, Xte = X[idx[:n_tr]], X[idx[n_tr:]]
-    ytr, yte = y[idx[:n_tr]], y[idx[n_tr:]]
-    d = T.run_dir(run_id)  # creates runs/mlpscan
-    np.savez(os.path.join(d, T._FEATURES),
-             X_train=Xtr, X_test=Xte, y_train=ytr, y_test=yte)
-    T._write_manifest(run_id, {"run_id": run_id, "fp_type": "synthetic"})
-    return run_id
 
 
 # Small/fast training kwargs so the CV fits finish quickly in tests.
@@ -128,8 +104,8 @@ def test_all_diverged_raises(seeded_run, monkeypatch):
     stubbing _mlp_train_once so no real training runs (avoids a flaky test that
     depends on a particular lr actually diverging)."""
     def fake_train_once(*args, **kwargs):
-        return {"model": None, "prep": None, "val_r2": float("nan"),
-                "train_r2": float("nan"), "input_dims": None,
+        return {"model": None, "prep": None, "val_score": float("nan"),
+                "train_score": float("nan"), "input_dims": None,
                 "epochs_run": 0, "diverged": True}
     monkeypatch.setattr(T, "_mlp_train_once", fake_train_once)
     with pytest.raises(ValueError, match="diverged"):

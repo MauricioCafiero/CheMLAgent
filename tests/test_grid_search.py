@@ -5,8 +5,11 @@ per hyperparameter, max 6 combinations total), the per-model whitelist, alias
 normalization, and the save/manifest contract that makes grid_search drop-in
 compatible with train_model -> evaluate_model/run_inference.
 
-Uses a synthetic features.npz (no RDKit/featurize step) so the search path is
-fast and focused. Run from a clean CWD under tmp_path so runs/ is isolated.
+The end-to-end tests run through the REAL pipeline (tests/conftest.py):
+prepare_chembl_csv + featurize_fingerprints ECFP on a slice of the repo's
+ChEMBL CSV, featurized once per module. Validator/caps/alias tests are
+data-free. The module-scoped seeded_run fixture switches CWD to a per-module
+tmp dir so runs/ is isolated.
 """
 
 import os
@@ -15,34 +18,6 @@ import numpy as np
 import pytest
 
 from chemlagent import tools as T
-
-
-# --- fixtures ---------------------------------------------------------------
-
-@pytest.fixture
-def seeded_run(tmp_path, monkeypatch):
-    """Create a run_id with a synthetic features.npz + seeded manifest.
-
-    Target is a linear function of the features so SVR/RF/LightGBM can all fit
-    it well enough for the asserts (r2 > 0, finite) to be meaningful.
-    """
-    monkeypatch.chdir(tmp_path)
-    run_id = "gridtest"
-    rng = np.random.default_rng(0)
-    n = 200
-    X = rng.normal(0, 1, size=(n, 20))
-    w = rng.normal(0, 1, size=20)
-    y = X @ w + 0.05 * rng.normal(size=n)
-    idx = rng.permutation(n)
-    n_tr = 160
-    Xtr, Xte = X[idx[:n_tr]], X[idx[n_tr:]]
-    ytr, yte = y[idx[:n_tr]], y[idx[n_tr:]]
-
-    d = T.run_dir(run_id)  # creates runs/gridtest
-    np.savez(os.path.join(d, T._FEATURES),
-             X_train=Xtr, X_test=Xte, y_train=ytr, y_test=yte)
-    T._write_manifest(run_id, {"run_id": run_id, "fp_type": "synthetic"})
-    return run_id
 
 
 # --- validator: caps & whitelist -------------------------------------------

@@ -46,6 +46,14 @@ from chemlagent.models import (
     random_forest_regression,
     lightgbm_regression,
     svr_regression,
+    random_forest_classifier,
+    lightgbm_classifier,
+    svc_classifier,
+)
+from chemlagent.classify import (
+    make_classes_df,
+    classification_metrics,
+    class_label_strings,
 )
 from chemlagent.products import publish_products
 
@@ -53,13 +61,13 @@ from chemlagent.products import publish_products
 # grid_search can build the same estimators train_model uses and wrap them in
 # GridSearchCV. n_jobs is pinned to 1 everywhere to avoid forking workers, which
 # re-triggers the libomp double-load segfault (see memory: torch-before-lightgbm).
-from sklearn.ensemble import RandomForestRegressor
-from sklearn.svm import SVR
+from sklearn.ensemble import RandomForestRegressor, RandomForestClassifier
+from sklearn.svm import SVR, SVC
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import StandardScaler
 from sklearn.model_selection import GridSearchCV
 from sklearn.metrics import r2_score
-from lightgbm import LGBMRegressor
+from lightgbm import LGBMRegressor, LGBMClassifier
 
 from chemlagent.descriptor_cleaning import impute_only_cleaner
 
@@ -68,6 +76,7 @@ __all__ = [
     "list_bioactives",
     "search_targets",
     "prepare_chembl_csv",
+    "prepare_classes",
     "featurize_fingerprints",
     "train_model",
     "grid_search",
@@ -164,13 +173,37 @@ def _record_model(run_id: str, model_type: str, model_path: str,
     return _write_manifest(run_id, manifest)
 
 
-def _write_predictions_csv(run_id: str, smiles_list, preds) -> str:
+def _run_task(run_id: str, record: dict | None = None) -> str:
+    """Task type ('regression' or 'classification') that a tool call should use.
+
+    set by prepare_classes (``manifest["task"] = "classification"``). When a
+    per-model ``record`` is given (e.g. manifest["models"]["mlp"]), a per-model
+    ``task`` field wins over the manifest-level one, so a run that holds both a
+    regression and a classification model still dispatches correctly.
+    """
+    if record is not None and record.get("task"):
+        return record["task"]
+    if os.path.exists(_manifest_path(run_id)):
+        return _read_manifest(run_id).get("task", "regression")
+    return "regression"
+
+
+def _write_predictions_csv(run_id: str, smiles_list, preds,
+                           pred_labels=None) -> str:
     """Write (SMILES, prediction) to runs/<run_id>/predictions.csv and publish
-    it to recent_work/. Returns the predictions CSV path."""
+    it to recent_work/. Returns the predictions CSV path. For classification
+    (pred_labels given) the columns are predicted_class (int indices) +
+    predicted_label (range strings) instead of the float prediction."""
     path = os.path.join(run_dir(run_id), "predictions.csv")
-    pd.DataFrame({"SMILES": list(smiles_list),
-                  "prediction": np.asarray(preds, dtype=float).reshape(-1)}
-                 ).to_csv(path, index=False)
+    if pred_labels is not None:
+        pd.DataFrame({"SMILES": list(smiles_list),
+                      "predicted_class": np.asarray(preds, dtype=int),
+                      "predicted_label": list(pred_labels)}
+                     ).to_csv(path, index=False)
+    else:
+        pd.DataFrame({"SMILES": list(smiles_list),
+                      "prediction": np.asarray(preds, dtype=float).reshape(-1)}
+                     ).to_csv(path, index=False)
     publish_products(run_id, run_dir(run_id), "predictions.csv", "manifest.json")
     return path
 
@@ -389,6 +422,85 @@ def search_targets(disease_names: list[str]) -> dict:
     return {"results": results, "summary": "".join(summary_parts)}
 
 
+# --- classification: turn the target into classes ---------------------------
+#
+# prepare_classes ports the user's CafChemClassifiers.make_classes to the run
+# pipeline: equal-count bands over the sorted target, written as int class
+# indices 0..K-1 plus human-readable range labels, and a manifest task flag
+# that every downstream tool (featurize / train / grid_search / evaluate /
+# inference) keys off. Regression runs simply never call it.
+
+def prepare_classes(run_id: str, num_classes: int = 2) -> dict:
+    """Divide the run's target column into classes for classification.
+
+    Reads runs/<run_id>/data.csv (from prepare_chembl_csv), bins the target
+    into ``num_classes`` approximately equal-count bands (adapted from the
+    user's CafChemClassifiers.make_classes: rows sorted by target, cut at
+    multiples of n // num_classes, plus the bottom/top values as cutoffs), and
+    writes two columns back to data.csv: ``class`` (int indices 0..K-1) and
+    ``class_labels`` (human-readable ranges like '4.1 < 5.6'). It also sets
+    manifest task='classification' with the n_classes + class_labels, which
+    makes all downstream tools (featurize_fingerprints, train_model,
+    grid_search, train_mlp, train_chemprop, evaluate_model, run_inference)
+    train classifier versions and report accuracy/MCC/F1 instead of R^2/MAE.
+
+    Call AFTER prepare_chembl_csv and BEFORE featurize_fingerprints (and
+    before train_chemprop, which reads data.csv directly). Counter-ions
+    ([Na+], [Cl-], etc.) are stripped from the SMILES column.
+
+    Args:
+        run_id: Pipeline run identifier; rewrites runs/<run_id>/data.csv in
+            place and updates manifest.json.
+        num_classes: Number of classes to divide the dataset into (default 2
+            = binary active/inactive). Must be >= 2 and <= half the row count.
+
+    Returns:
+        dict with keys: run_id, num_classes (the ACTUAL number of classes; the
+        band algorithm can produce one fewer if cutoffs collide), n_samples,
+        samples_per_class, class_labels (list of range strings),
+        class_counts (list of sample counts per class), manifest_path.
+    """
+    print("Prepare classes tool")
+    print("=" * 55)
+    data_csv = os.path.join(run_dir(run_id), "data.csv")
+    if not os.path.exists(data_csv):
+        raise FileNotFoundError(
+            f"{data_csv} not found. Run prepare_chembl_csv for run_id "
+            f"{run_id!r} first.")
+    df = pd.read_csv(data_csv)
+    df, class_labels = make_classes_df(df, "target", num_classes)
+    df.to_csv(data_csv, index=False)
+
+    n_classes = len(class_labels)
+    counts = np.bincount(df["class"].to_numpy(dtype=int),
+                         minlength=n_classes).tolist()
+
+    manifest = _read_manifest(run_id) if os.path.exists(
+        _manifest_path(run_id)) else {}
+    manifest.update({
+        "run_id": run_id,
+        "task": "classification",
+        "n_classes": int(n_classes),
+        "class_labels": class_labels,
+    })
+    manifest_path = _write_manifest(run_id, manifest)
+    publish_products(run_id, run_dir(run_id), "data.csv", _MANIFEST)
+
+    if print_flag:
+        for label, count in zip(class_labels, counts):
+            print(f"  {label}: {count} samples")
+
+    return {
+        "run_id": run_id,
+        "num_classes": int(n_classes),
+        "n_samples": int(len(df)),
+        "samples_per_class": int(len(df) // n_classes),
+        "class_labels": class_labels,
+        "class_counts": [int(c) for c in counts],
+        "manifest_path": manifest_path,
+    }
+
+
 def featurize_fingerprints(
     run_id: str,
     fp_type: str = "ECFP",
@@ -401,6 +513,10 @@ def featurize_fingerprints(
     scaffold-aware train/test split. The resulting feature matrices and a
     SMILES->features featurizer are saved under runs/<run_id>/ for use by
     train_model / evaluate_model / run_inference.
+
+    If prepare_classes has been run on this run_id (task=classification), the
+    split is against the int CLASS labels (for classifier training) instead of
+    the numeric target.
 
     Args:
         run_id: Pipeline run identifier; reads runs/<run_id>/data.csv and
@@ -424,7 +540,19 @@ def featurize_fingerprints(
             f"{run_id!r} first.")
     df = pd.read_csv(data_csv)
     smiles = df["SMILES"].tolist()
-    targets = df["target"].to_numpy(dtype=float)
+    # Classification runs (prepare_classes set task='classification') featurize
+    # against the int class column; regression against the numeric target.
+    task = (_read_manifest(run_id).get("task", "regression")
+            if os.path.exists(_manifest_path(run_id)) else "regression")
+    if task == "classification":
+        if "class" not in df.columns:
+            raise ValueError(
+                f"Run {run_id!r} is a classification run but data.csv has no "
+                f"'class' column. Run prepare_classes(run_id, num_classes=...) "
+                f"before featurize_fingerprints.")
+        targets = df["class"].to_numpy(dtype=np.int64)
+    else:
+        targets = df["target"].to_numpy(dtype=float)
 
     gfp = get_fingerprints(
         smiles_list=smiles,
@@ -461,6 +589,9 @@ def featurize_fingerprints(
         "n_train": int(X_train.shape[0]),
         "n_test": int(X_test.shape[0]),
         "n_features": int(X_train.shape[1]),
+        "task": task,
+        "n_classes": int(len(np.unique(targets))) if task == "classification"
+        else None,
     })
     _write_manifest(run_id, manifest)
     return manifest
@@ -501,17 +632,41 @@ def train_model(
     y_train, y_test = feats["y_train"], feats["y_test"]
 
     model_type = _canonical_model_type(model_type)
+    # prepare_classes set task='classification': train the classifier variant
+    # of the requested model (same estimator family, int class targets from
+    # features.npz). Accuracy replaces R^2 everywhere below.
+    cls = _run_task(run_id) == "classification"
+    if cls:
+        y_train = np.asarray(y_train, dtype=np.int64)
+        y_test = np.asarray(y_test, dtype=np.int64)
+
     if model_type == "random_forest":
-        r2, r2_train, model = random_forest_regression(
-            X_train, y_train, X_test, y_test,
-            n_estimators=n_estimators, random_state=42)
+        if cls:
+            acc, acc_train, model = random_forest_classifier(
+                X_train, y_train, X_test, y_test,
+                n_estimators=n_estimators, random_state=42)
+        else:
+            r2, r2_train, model = random_forest_regression(
+                X_train, y_train, X_test, y_test,
+                n_estimators=n_estimators, random_state=42)
     elif model_type == "lightgbm":
-        r2, r2_train, model = lightgbm_regression(
-            X_train, y_train, X_test, y_test,
-            n_estimators=n_estimators, random_state=42, n_jobs=1)
+        if cls:
+            acc, acc_train, model = lightgbm_classifier(
+                X_train, y_train, X_test, y_test,
+                n_estimators=n_estimators, random_state=42, n_jobs=1)
+        else:
+            r2, r2_train, model = lightgbm_regression(
+                X_train, y_train, X_test, y_test,
+                n_estimators=n_estimators, random_state=42, n_jobs=1)
     elif model_type == "svr":
-        # Tuned defaults from models.svr_regression (poly kernel, no PCA).
-        r2, r2_train, model = svr_regression(X_train, y_train, X_test, y_test)
+        # Tuned defaults from models.svr_regression (poly kernel, no PCA);
+        # for classification runs the SVC counterpart (models.svc_classifier).
+        if cls:
+            acc, acc_train, model = svc_classifier(
+                X_train, y_train, X_test, y_test)
+        else:
+            r2, r2_train, model = svr_regression(
+                X_train, y_train, X_test, y_test)
     else:
         raise ValueError(
             f"Unknown model_type {model_type!r}. Use 'random_forest', "
@@ -523,6 +678,21 @@ def train_model(
     model_path = os.path.join(run_dir(run_id), f"model_{model_type}.pkl")
     with open(model_path, "wb") as fh:
         pickle.dump(model, fh)
+
+    if cls:
+        manifest_path = _record_model(
+            run_id, model_type, model_path, task="classification",
+            accuracy=float(acc), accuracy_train=float(acc_train))
+        publish_products(run_id, run_dir(run_id),
+                         os.path.basename(model_path), _MANIFEST)
+        return {
+            "run_id": run_id,
+            "model_type": model_type,
+            "model_path": model_path,
+            "accuracy": float(acc),
+            "accuracy_train": float(acc_train),
+            "manifest_path": manifest_path,
+        }
 
     manifest_path = _record_model(
         run_id, model_type, model_path,
@@ -624,28 +794,40 @@ def _validate_param_grid(model_type: str,
     return clean, n_combos
 
 
-def _build_search_estimator(model_type: str,
-                            user_grid: dict[str, list]) -> tuple[object, dict[str, list]]:
+def _build_search_estimator(model_type: str, user_grid: dict[str, list],
+                            classification: bool = False
+                            ) -> tuple[object, dict[str, list]]:
     """Build the base estimator + sklearn-form grid for one model type.
 
-    RF/LightGBM get the bare regressor (param names match the user grid
-    directly). SVR gets the same clean -> scale -> SVR(poly, degree=2, coef0=7)
-    Pipeline as models.svr_regression, with user params namespaced as 'svr__C'
-    etc. so GridSearchCV routes them to the SVR step.
+    RF/LightGBM get the bare estimator (param names match the user grid
+    directly). SVR/SVC get the same clean -> scale -> poly-kernel Pipeline as
+    the models.py functions, with user params namespaced as 'svr__C' etc. so
+    GridSearchCV routes them to the SVR step. classification=True swaps every
+    estimator for its classifier counterpart (models.py classifier defaults:
+    SVC poly degree=3, coef0=2).
     """
     if model_type == "random_forest":
-        est = RandomForestRegressor(random_state=42, n_jobs=1)
+        if classification:
+            est = RandomForestClassifier(random_state=42, n_jobs=1)
+        else:
+            est = RandomForestRegressor(random_state=42, n_jobs=1)
         return est, dict(user_grid)
     if model_type == "lightgbm":
-        est = LGBMRegressor(random_state=42, n_jobs=1, verbose=-1)
+        if classification:
+            est = LGBMClassifier(random_state=42, n_jobs=1, verbose=-1)
+        else:
+            est = LGBMRegressor(random_state=42, n_jobs=1, verbose=-1)
         return est, dict(user_grid)
-    # svr
+    # svr / svc
+    name = "svc" if classification else "svr"
+    cls_ = SVC(kernel="poly", degree=3, coef0=2) if classification else \
+        SVR(kernel="poly", degree=2, coef0=7)
     est = Pipeline([
         ("clean", impute_only_cleaner()),
         ("scale", StandardScaler()),
-        ("svr", SVR(kernel="poly", degree=2, coef0=7)),
+        (name, cls_),
     ])
-    grid = {f"svr__{k}": v for k, v in user_grid.items()}
+    grid = {f"{name}__{k}": v for k, v in user_grid.items()}
     return est, grid
 
 
@@ -677,6 +859,12 @@ def grid_search(
       - lightgbm: n_estimators, num_leaves, learning_rate, min_child_samples
       - svr: C, gamma, epsilon (the poly kernel's degree=2 / coef0=7 are fixed
         at the literature value and are NOT searched)
+
+    Classification runs (prepare_classes set task='classification') search the
+    classifier variants (RandomForestClassifier / LGBMClassifier / a poly-SVC
+    Pipeline, degree=3 / coef0=2 fixed) and score CV folds by accuracy; the
+    result keys are then best_cv_accuracy / accuracy instead of best_cv_r2 /
+    r2.
 
     Use the SAME run_id as the preceding featurize_fingerprints call. This
     saves model_<model_type>.pkl (per-type, so it does not overwrite a
@@ -713,11 +901,19 @@ def grid_search(
     model_type = canonical
 
     user_grid, n_combos = _validate_param_grid(model_type, param_grid)
-    estimator, sk_grid = _build_search_estimator(model_type, user_grid)
 
     feats = np.load(os.path.join(run_dir(run_id), _FEATURES))
     X_train, X_test = feats["X_train"], feats["X_test"]
     y_train, y_test = feats["y_train"], feats["y_test"]
+
+    # prepare_classes set task='classification': search the classifier
+    # variant and score CV folds by accuracy (regression keeps scoring r2).
+    cls = _run_task(run_id) == "classification"
+    if cls:
+        y_train = np.asarray(y_train, dtype=np.int64)
+        y_test = np.asarray(y_test, dtype=np.int64)
+    estimator, sk_grid = _build_search_estimator(model_type, user_grid,
+                                                 classification=cls)
 
     # Shrink CV folds for small train sets so each fold still has enough rows.
     n_train = int(np.asarray(y_train).reshape(-1).shape[0])
@@ -727,8 +923,9 @@ def grid_search(
 
     print(f"Searching {model_type} over {n_combos} combination(s) "
           f"({cv}-fold CV, n_jobs=1).")
+    scoring = "accuracy" if cls else "r2"
     gs = GridSearchCV(
-        estimator, sk_grid, cv=cv, scoring="r2",
+        estimator, sk_grid, cv=cv, scoring=scoring,
         n_jobs=1, refit=True, error_score="raise",
     )
     gs.fit(X_train, y_train)
@@ -736,28 +933,56 @@ def grid_search(
     best = gs.best_estimator_          # refit on full X_train (refit=True)
     best_cv = float(gs.best_score_)
 
-    # best_params_ uses sklearn namespaced names for SVR ('svr__C'); strip the
-    # prefix so the return value uses the user-facing hyperparameter names.
+    # best_params_ uses sklearn namespaced names for SVR/SVC ('svr__C'); strip
+    # the prefix so the return value uses the user-facing hyperparameter names.
     best_params = {
-        (k.split("__", 1)[1] if k.startswith("svr__") else k): v
+        (k.split("__", 1)[1] if "__" in k else k): v
         for k, v in gs.best_params_.items()
     }
 
     y_pred = best.predict(X_test)
     y_train_pred = best.predict(X_train)
-    r2 = float(r2_score(y_test, y_pred))
-    r2_train = float(r2_score(y_train, y_train_pred))
+    if cls:
+        from sklearn.metrics import accuracy_score
+        acc = float(accuracy_score(y_test, y_pred))
+        acc_train = float(accuracy_score(y_train, y_train_pred))
+    else:
+        r2 = float(r2_score(y_test, y_pred))
+        r2_train = float(r2_score(y_train, y_train_pred))
 
     if print_flag:
-        print(f"CV results (sorted by mean r2):")
+        print(f"CV results (sorted by mean {scoring}):")
         rows = sorted(gs.cv_results_["mean_test_score"], reverse=True)
         for rank, mean in enumerate(rows, 1):
-            print(f"  {rank}. mean_cv_r2={mean:.4f}")
-        print(f"Best params: {best_params}  (best_cv_r2={best_cv:.4f})")
+            print(f"  {rank}. mean_cv_{scoring}={mean:.4f}")
+        print(f"Best params: {best_params}  (best_cv_{scoring}={best_cv:.4f})")
 
     model_path = os.path.join(run_dir(run_id), f"model_{model_type}.pkl")
     with open(model_path, "wb") as fh:
         pickle.dump(best, fh)
+
+    if cls:
+        manifest_path = _record_model(
+            run_id, model_type, model_path, task="classification",
+            accuracy=acc, accuracy_train=acc_train,
+            grid_search=True,
+            best_params={k: (None if v is None else v) for k, v in
+                         best_params.items()},
+            best_cv_accuracy=best_cv,
+            n_grid_combinations=n_combos,
+            cv_folds=cv)
+        publish_products(run_id, run_dir(run_id),
+                         os.path.basename(model_path), _MANIFEST)
+        return {
+            "run_id": run_id,
+            "model_type": model_type,
+            "best_params": best_params,
+            "best_cv_accuracy": best_cv,
+            "accuracy": acc,
+            "accuracy_train": acc_train,
+            "model_path": model_path,
+            "manifest_path": manifest_path,
+        }
 
     manifest_path = _record_model(
         run_id, model_type, model_path,
@@ -863,15 +1088,18 @@ def _validate_mlp_grid(
 
 def _mlp_train_once(X_train, y_train, X_val, y_val, combo: dict,
                     batch_size: int, epochs: int, patience: int,
-                    min_delta: float, rd_abs: str) -> dict:
+                    min_delta: float, rd_abs: str,
+                    classifier: bool = False, num_classes: int = 1) -> dict:
     """Train one MLP for one hyperparameter combo and score it on (X_val, y_val).
 
     Mirrors the per-combo block in big_datasets/scripts/mlp_grid_scan.py:
     prep_data (aggressive clean -> standardize -> PCA(combo['pca_var'])) fit on
     X_train, MLP_Model(neurons, num_hidden_layers, skip_connection=True), SGD(
-    lr, weight_decay) + MSE + early stopping (patience/min_delta), then
-    evaluate_regression for train/val r2. SGD divergence (loss -> NaN, most
-    often at high lr) is caught and reported as diverged=True rather than
+    lr, weight_decay) + MSE (NLLLoss + LogSoftmax head when classifier=True)
+    + early stopping (patience/min_delta), then evaluate_regression
+    (evaluate_classification when classifier=True) for train/val scores — R^2
+    for regression, accuracy for classification. SGD divergence (loss -> NaN,
+    most often at high lr) is caught and reported as diverged=True rather than
     crashing the scan. Runs from rd_abs so MLP_Model's params file lands in the
     run dir, not the project root. Returns the trained model + fitted prep so
     the caller can either keep them (the final refit) or discard them (CV folds).
@@ -882,32 +1110,37 @@ def _mlp_train_once(X_train, y_train, X_val, y_val, combo: dict,
     matplotlib.use("Agg")  # evaluate_regression plots; never pop a GUI window
     import matplotlib.pyplot as plt
     from chemlagent.pytorch_mlp import (
-        MLP_Model, prep_data, train, evaluate_regression)
+        MLP_Model, prep_data, train, evaluate_regression,
+        evaluate_classification)
 
     cwd = os.getcwd()
     os.chdir(os.path.abspath(rd_abs))
     model = prep = None
-    val_r2 = train_r2 = float("nan")
+    val_score = train_score = float("nan")
     input_dims = None
     epochs_run = 0
     diverged = False
     try:
         prep = prep_data(batch_size=batch_size, shuffle=True,
-                         reduce_dim="pca", pca_var=combo["pca_var"])
+                         reduce_dim="pca", pca_var=combo["pca_var"],
+                         classifier_flag=classifier)
         _, _, train_loader, _ = prep.create_data_loader(
             X_train, y_train, X_val, y_val)
         input_dims = int(prep.X_train.shape[1])
         model = MLP_Model(neurons=combo["neurons"], input_dims=input_dims,
                           num_hidden_layers=combo["num_hidden_layers"],
-                          skip_connection=True)
-        loss_fn = nn.MSELoss()
+                          skip_connection=True,
+                          classifier_flag=classifier, num_classes=num_classes)
+        loss_fn = nn.NLLLoss() if classifier else nn.MSELoss()
         opt = torch.optim.SGD(model.parameters(), lr=combo["lr"],
                               weight_decay=combo["weight_decay"])
         best_loss = float("inf")
         stale = 0
         for epoch in range(epochs):
             epochs_run = epoch + 1
-            epoch_loss = train(train_loader, model, loss_fn, opt)
+            epoch_loss = train(train_loader, model, loss_fn, opt,
+                               classifier_flag=classifier,
+                               num_classes=num_classes)
             if not np.isfinite(epoch_loss):
                 diverged = True
                 break
@@ -919,12 +1152,19 @@ def _mlp_train_once(X_train, y_train, X_val, y_val, combo: dict,
                 if stale >= patience:
                     break
         if not diverged:
-            train_r2, val_r2 = evaluate_regression(
-                prep.X_train, np.asarray(y_train, dtype=float),
-                prep.X_test, np.asarray(y_val, dtype=float), model)
-            if not np.isfinite(val_r2):
+            if classifier:
+                # Class labels: int64 for NLLLoss / accuracy_score.
+                train_score, val_score = evaluate_classification(
+                    prep.X_train, np.asarray(y_train, dtype=np.int64),
+                    prep.X_test, np.asarray(y_val, dtype=np.int64), model)
+            else:
+                train_score, val_score = evaluate_regression(
+                    prep.X_train, np.asarray(y_train, dtype=float),
+                    prep.X_test, np.asarray(y_val, dtype=float), model)
+            val_score = float(val_score)
+            if not np.isfinite(val_score):
                 diverged = True
-                val_r2 = float("nan")
+                val_score = float("nan")
         plt.close("all")
     except Exception as exc:
         diverged = True
@@ -932,40 +1172,42 @@ def _mlp_train_once(X_train, y_train, X_val, y_val, combo: dict,
             print(f"  [diverged] {combo}: {exc!r}")
     finally:
         os.chdir(cwd)
-    return {"model": model, "prep": prep, "val_r2": float(val_r2),
-            "train_r2": float(train_r2), "input_dims": input_dims,
+    return {"model": model, "prep": prep, "val_score": float(val_score),
+            "train_score": float(train_score), "input_dims": input_dims,
             "epochs_run": int(epochs_run), "diverged": bool(diverged)}
 
 
 def _mlp_cv(combo: dict, X_train, y_train, cv: int, batch_size: int,
-            epochs: int, patience: int, min_delta: float, rd_abs: str
+            epochs: int, patience: int, min_delta: float, rd_abs: str,
+            classifier: bool = False, num_classes: int = 1
             ) -> tuple[float, int]:
-    """k-fold CV for one combo. Returns (mean_val_r2, n_diverged_folds).
+    """k-fold CV for one combo. Returns (mean_val_score, n_diverged_folds).
 
     Each fold fits prep_data on the fold-train, trains the MLP, and scores on
-    the held-out fold-val. A diverged fold (SGD NaN) contributes no r2 but is
-    counted; the combo's score is the mean over the non-diverged folds (NaN if
-    every fold diverged). Single-threaded (no worker fork) to avoid the Apple-
-    Silicon libomp double-load segfault (see memory torch-before-lightgbm).
+    the held-out fold-val (R^2 for regression, accuracy for classification). A
+    diverged fold (SGD NaN) contributes no score but is counted; the combo's
+    score is the mean over the non-diverged folds (NaN if every fold diverged).
+    Single-threaded (no worker fork) to avoid the Apple-Silicon libomp
+    double-load segfault (see memory torch-before-lightgbm).
     """
     from sklearn.model_selection import KFold
     kf = KFold(n_splits=cv, shuffle=True, random_state=42)
-    val_r2s: list[float] = []
+    val_scores: list[float] = []
     n_div = 0
     for tr_idx, val_idx in kf.split(X_train):
         res = _mlp_train_once(
             X_train[tr_idx], y_train[tr_idx], X_train[val_idx],
             y_train[val_idx], combo, batch_size, epochs, patience, min_delta,
-            rd_abs)
-        if res["diverged"] or not np.isfinite(res["val_r2"]):
+            rd_abs, classifier=classifier, num_classes=num_classes)
+        if res["diverged"] or not np.isfinite(res["val_score"]):
             n_div += 1
         else:
-            val_r2s.append(res["val_r2"])
+            val_scores.append(res["val_score"])
         # Free the fold's model + prep so 30 CV trainings don't accumulate.
         res["model"] = None
         res["prep"] = None
-    mean_r2 = float(np.mean(val_r2s)) if val_r2s else float("nan")
-    return mean_r2, n_div
+    mean_score = float(np.mean(val_scores)) if val_scores else float("nan")
+    return mean_score, n_div
 
 
 def mlp_scan(
@@ -986,6 +1228,11 @@ def mlp_scan(
     split, and saves the result exactly like train_mlp (model_mlp.pt +
     mlp_prep.npz + mlp_arch in the manifest), so evaluate_model(run_id, 'mlp')
     and run_inference_mlp work unchanged on the result.
+
+    Classification runs (prepare_classes set task='classification'): the scan
+    trains the classifier MLP (LogSoftmax head, NLLLoss) and CV/refit scores
+    are accuracies; result keys are best_cv_accuracy / accuracy instead of
+    best_cv_r2 / r2.
 
     The grid is capped to keep a tool call bounded: at most 3 values per
     hyperparameter and at most 6 total combinations (a 3x3=9 grid is rejected).
@@ -1053,8 +1300,23 @@ def mlp_scan(
     feats = np.load(feat_path)
     X_train = np.ascontiguousarray(feats["X_train"], dtype=np.float64)
     X_test = np.ascontiguousarray(feats["X_test"], dtype=np.float64)
-    y_train = np.asarray(feats["y_train"], dtype=float)
-    y_test = np.asarray(feats["y_test"], dtype=float)
+    # Classification runs (prepare_classes set task='classification'): int
+    # class labels + accuracy as the CV/refit score. Regression: float
+    # targets + R^2.
+    cls = _run_task(run_id) == "classification"
+    classifier = num_classes = None
+    if cls:
+        classifier = True
+        num_classes = int(_read_manifest(run_id).get("n_classes", 0))
+        if num_classes < 2:
+            raise ValueError(
+                f"Run {run_id!r} is a classification run but the manifest has "
+                f"no n_classes. Run prepare_classes first.")
+        y_train = np.asarray(feats["y_train"], dtype=np.int64)
+        y_test = np.asarray(feats["y_test"], dtype=np.int64)
+    else:
+        y_train = np.asarray(feats["y_train"], dtype=float)
+        y_test = np.asarray(feats["y_test"], dtype=float)
 
     n_train = int(y_train.reshape(-1).shape[0])
     cv = int(cv_folds)
@@ -1067,25 +1329,26 @@ def mlp_scan(
               for vals in itertools.product(*(grid[k] for k in _MLP_SCAN_KEY_ORDER))]
 
     rd_abs = os.path.abspath(run_dir(run_id))
+    score_name = "cv_accuracy" if cls else "cv_r2"
     print(f"Scanning MLP over {n_combos} combination(s) "
           f"({cv}-fold CV, {len(combos)} total fits).")
 
-    best = None  # {"combo", "mean_cv_r2", "n_diverged"}
+    best = None  # {"combo", "mean_cv_score", "n_diverged"}
     n_diverged_combos = 0
     t0 = time.time()
     for idx, combo in enumerate(combos, 1):
-        mean_r2, n_div = _mlp_cv(
+        mean_score, n_div = _mlp_cv(
             combo, X_train, y_train, cv, batch_size, epochs, patience,
-            min_delta, rd_abs)
-        finite = np.isfinite(mean_r2)
+            min_delta, rd_abs, classifier=bool(cls), num_classes=num_classes or 1)
+        finite = np.isfinite(mean_score)
         if not finite:
             n_diverged_combos += 1
-        if finite and (best is None or mean_r2 > best["mean_cv_r2"]):
-            best = {"combo": combo, "mean_cv_r2": float(mean_r2),
+        if finite and (best is None or mean_score > best["mean_cv_score"]):
+            best = {"combo": combo, "mean_cv_score": float(mean_score),
                     "n_diverged_folds": n_div}
         if print_flag:
-            print(f"[{idx}/{len(combos)}] {combo} -> cv_r2="
-                  f"{mean_r2 if finite else float('nan'):.4f} "
+            print(f"[{idx}/{len(combos)}] {combo} -> {score_name}="
+                  f"{mean_score if finite else float('nan'):.4f} "
                   f"(diverged folds: {n_div}/{cv})")
 
     if best is None:
@@ -1098,16 +1361,17 @@ def mlp_scan(
     # test split. This is the model saved as the run's 'mlp' artifact.
     refit = _mlp_train_once(
         X_train, y_train, X_test, y_test, best["combo"], batch_size, epochs,
-        patience, min_delta, rd_abs)
-    if refit["diverged"] or not np.isfinite(refit["val_r2"]):
+        patience, min_delta, rd_abs, classifier=bool(cls),
+        num_classes=num_classes or 1)
+    if refit["diverged"] or not np.isfinite(refit["val_score"]):
         raise ValueError(
             f"Best-by-CV combination {best['combo']} diverged when refit on "
             f"the full train set. Try a lower lr or smaller weight_decay.")
 
     model, prep = refit["model"], refit["prep"]
     input_dims = refit["input_dims"]
-    test_r2 = float(refit["val_r2"])
-    train_r2 = float(refit["train_r2"])
+    test_score = float(refit["val_score"])
+    train_score = float(refit["train_score"])
     epochs_run = int(refit["epochs_run"])
 
     model_path = os.path.join(run_dir(run_id), _MLP_MODEL)
@@ -1117,6 +1381,50 @@ def mlp_scan(
     # Free the refit model + prep (state_dict / stats are now on disk).
     del model, prep
 
+    mlp_arch_out = {"neurons": best["combo"]["neurons"],
+                    "input_dims": input_dims,
+                    "num_hidden_layers": best["combo"]["num_hidden_layers"],
+                    "skip_connection": True}
+    if cls:
+        mlp_arch_out.update({"classifier_flag": True,
+                             "num_classes": int(num_classes)})
+
+    if cls:
+        manifest_path = _record_model(
+            run_id, "mlp", model_path,
+            mlp_prep_path=prep_path,
+            mlp_arch=mlp_arch_out,
+            task="classification",
+            accuracy=test_score,
+            accuracy_train=train_score,
+            epochs_run=epochs_run,
+            mlp_scan=True,
+            best_params=best["combo"],
+            best_cv_accuracy=float(best["mean_cv_score"]),
+            n_grid_combinations=int(n_combos),
+            cv_folds=int(cv),
+            n_diverged_combos=int(n_diverged_combos))
+        publish_products(run_id, run_dir(run_id), _MLP_MODEL, _MLP_PREP,
+                         _MANIFEST)
+        if print_flag:
+            print(f"Best params: {best['combo']}  (best_cv_accuracy="
+                  f"{best['mean_cv_score']:.4f}, refit test accuracy="
+                  f"{test_score:.4f})")
+        return {
+            "run_id": run_id,
+            "model_type": "mlp",
+            "best_params": best["combo"],
+            "best_cv_accuracy": float(best["mean_cv_score"]),
+            "accuracy": test_score,
+            "accuracy_train": train_score,
+            "n_combinations": int(n_combos),
+            "n_diverged_combos": int(n_diverged_combos),
+            "cv_folds": int(cv),
+            "epochs_run": epochs_run,
+            "model_path": model_path,
+            "manifest_path": manifest_path,
+        }
+
     manifest_path = _record_model(
         run_id, "mlp", model_path,
         mlp_prep_path=prep_path,
@@ -1124,12 +1432,12 @@ def mlp_scan(
                   "input_dims": input_dims,
                   "num_hidden_layers": best["combo"]["num_hidden_layers"],
                   "skip_connection": True},
-        r2=test_r2,
-        r2_train=train_r2,
+        r2=test_score,
+        r2_train=train_score,
         epochs_run=epochs_run,
         mlp_scan=True,
         best_params=best["combo"],
-        best_cv_r2=float(best["mean_cv_r2"]),
+        best_cv_r2=float(best["mean_cv_score"]),
         n_grid_combinations=int(n_combos),
         cv_folds=int(cv),
         n_diverged_combos=int(n_diverged_combos))
@@ -1137,15 +1445,15 @@ def mlp_scan(
 
     if print_flag:
         print(f"Best params: {best['combo']}  (best_cv_r2="
-              f"{best['mean_cv_r2']:.4f}, refit test r2={test_r2:.4f})")
+              f"{best['mean_cv_score']:.4f}, refit test r2={test_score:.4f})")
 
     return {
         "run_id": run_id,
         "model_type": "mlp",
         "best_params": best["combo"],
-        "best_cv_r2": float(best["mean_cv_r2"]),
-        "r2": test_r2,
-        "r2_train": train_r2,
+        "best_cv_r2": float(best["mean_cv_score"]),
+        "r2": test_score,
+        "r2_train": train_score,
         "n_combinations": int(n_combos),
         "n_diverged_combos": int(n_diverged_combos),
         "cv_folds": int(cv),
@@ -1166,6 +1474,11 @@ def evaluate_model(run_id: str, model_type: str | None = None) -> dict:
     a LightGBM model and an MLP on the same run, call
     ``evaluate_model(run_id, "lightgbm")`` and ``evaluate_model(run_id, "mlp")``
     to compare them side by side without retraining either.
+
+    Classification runs (prepare_classes set task='classification'): accuracy,
+    balanced accuracy, MCC, macro F1 and a row-normalized confusion matrix are
+    reported instead of R^2/MAE, and predictions come back as int class
+    indices plus their range labels from the manifest.
 
     Dispatches on the model type:
 
@@ -1219,18 +1532,41 @@ def evaluate_model(run_id: str, model_type: str | None = None) -> dict:
 
     feats = np.load(os.path.join(run_dir(run_id), _FEATURES))
     X_test, y_test = feats["X_test"], feats["y_test"]
-    truths = np.asarray(y_test, dtype=float).reshape(-1)
+    # Classification runs (prepare_classes) store int class indices in
+    # features.npz; regression stores float targets. The per-model record's
+    # own task field wins (mixed regression+classification runs).
+    cls = _run_task(run_id, record) == "classification"
+    if cls:
+        truths = np.asarray(y_test, dtype=np.int64).reshape(-1)
+    else:
+        truths = np.asarray(y_test, dtype=float).reshape(-1)
 
     if model_type in ("random_forest", "lightgbm", "svr"):
         with open(record["model_path"], "rb") as fh:
             model = pickle.load(fh)
         preds = np.asarray(model.predict(X_test), dtype=float).reshape(-1)
+        if cls:
+            preds = preds.astype(np.int64)
     elif model_type == "mlp":
         preds = _evaluate_mlp(record, run_dir(run_id), X_test)
     elif model_type == "chemprop":
-        # test-split r2/mae were computed at train time (scaffold split) and
+        # test-split metrics were computed at train time (scaffold split) and
         # stored in the manifest; replay them. Per-molecule predictions are
-        # not persisted for chemprop.
+        # not persisted for chemprop. Classification records accuracy/MCC/F1;
+        # regression records r2/mae.
+        if cls:
+            return {
+                "run_id": run_id,
+                "model_type": "chemprop",
+                "accuracy": float(record.get("accuracy", float("nan"))),
+                "balanced_accuracy": float(record.get(
+                    "balanced_accuracy", float("nan"))),
+                "mcc": float(record.get("mcc", float("nan"))),
+                "f1_macro": float(record.get("f1_macro", float("nan"))),
+                "n_test": int(record.get("n_test", 0)),
+                "predictions": [],
+                "truths": [],
+            }
         return {
             "run_id": run_id,
             "model_type": "chemprop",
@@ -1245,6 +1581,25 @@ def evaluate_model(run_id: str, model_type: str | None = None) -> dict:
             f"Cannot evaluate run {run_id!r}: manifest model_type is "
             f"{model_type!r} (expected random_forest/lightgbm/svr/mlp/"
             f"chemprop). Train a model for this run first.")
+
+    if cls:
+        m = classification_metrics(truths, preds)
+        pred_labels = class_label_strings(preds,
+                                          _read_manifest(run_id)
+                                          .get("class_labels", []))
+        return {
+            "run_id": run_id,
+            "model_type": model_type,
+            "accuracy": m["accuracy"],
+            "balanced_accuracy": m["balanced_accuracy"],
+            "mcc": m["mcc"],
+            "f1_macro": m["f1_macro"],
+            "confusion_matrix": m["confusion_matrix"],
+            "n_test": m["n_test"],
+            "predictions": preds.tolist(),
+            "prediction_labels": pred_labels,
+            "truths": truths.tolist(),
+        }
 
     return {
         "run_id": run_id,
@@ -1311,15 +1666,21 @@ def _evaluate_mlp(record: dict, rd: str, X_test) -> np.ndarray:
     try:
         model = MLP_Model(neurons=arch["neurons"], input_dims=arch["input_dims"],
                           num_hidden_layers=arch["num_hidden_layers"],
-                          skip_connection=arch["skip_connection"])
+                          skip_connection=arch["skip_connection"],
+                          classifier_flag=bool(arch.get("classifier_flag", False)),
+                          num_classes=int(arch.get("num_classes", 1)))
     finally:
         os.chdir(cwd)
     model.load_state_dict(torch.load(model_path, weights_only=True))
     Xt = Xt.to(next(model.parameters()).device)
     model.eval()
     with torch.inference_mode():
-        preds = model(Xt).cpu().numpy().reshape(-1)
-    return preds
+        out = model(Xt).cpu().numpy()
+    # classifier_flag=True models output (n, num_classes) log-softmax; the
+    # prediction is the argmax class index. Regression outputs (n,) values.
+    if arch.get("classifier_flag"):
+        return out.argmax(axis=1).astype(np.int64)
+    return out.reshape(-1)
 
 
 def run_inference(run_id: str, smiles_list: list[str],
@@ -1330,6 +1691,11 @@ def run_inference(run_id: str, smiles_list: list[str],
     with the saved model, and inverts the log10 transform applied during data
     prep if the manifest records log_transformed=True (so predictions come back
     in the original units, e.g. IC50 nM).
+
+    Classification runs (prepare_classes set task='classification'): the saved
+    classifier's predictions are int class indices; the run's range labels
+    (e.g. '4.1 < 5.6') come back alongside them and no log transform is
+    inverted.
 
     This tool covers the sklearn fingerprint models (random_forest / lightgbm /
     svr). For an MLP use run_inference_mlp; for a Chemprop MPNN use
@@ -1380,6 +1746,25 @@ def run_inference(run_id: str, smiles_list: list[str],
     X = featurizer.transform(smiles_list)
     preds = np.asarray(model.predict(X), dtype=float).reshape(-1)
 
+    # Classification runs: predictions are int class indices -> range labels.
+    # No log transform / no original-unit inversion for classes.
+    cls = _run_task(run_id, record if model_type is not None else manifest) \
+        == "classification"
+    if cls:
+        pred_classes = preds.astype(np.int64)
+        pred_labels = class_label_strings(pred_classes,
+                                          manifest["class_labels"])
+        pred_path = _write_predictions_csv(run_id, smiles_list, pred_classes,
+                                           pred_labels)
+        return {
+            "run_id": run_id,
+            "task": "classification",
+            "smiles": list(smiles_list),
+            "predicted_class": pred_classes.tolist(),
+            "predicted_labels": pred_labels,
+            "predictions_csv": pred_path,
+        }
+
     # Recover original-unit target. prepare_chembl_csv records whether the
     # target was log10-transformed; if so, invert with 10**pred.
     log_transformed = manifest.get("log_transformed", False)
@@ -1417,6 +1802,10 @@ def train_mlp(
     hyperparameters: SGD(lr=0.002, weight_decay=0.2), batch 32, raw targets.
     Saves weights + preprocessing stats under runs/<run_id>/.
 
+    Classification runs (prepare_classes set task='classification'): trains
+    the classifier variant (LogSoftmax head over the run's n_classes, NLLLoss
+    on int class labels) and reports accuracy instead of R^2.
+
     Training stops early once the epoch-averaged training loss stops
     improving: if it does not fall by at least ``min_delta`` below the best
     seen so far for ``patience`` consecutive epochs, the loop breaks (so a
@@ -1442,11 +1831,28 @@ def train_mlp(
     print("=" * 55)
     import torch
     import torch.nn as nn
-    from chemlagent.pytorch_mlp import MLP_Model, prep_data, train, evaluate_regression
+    from chemlagent.pytorch_mlp import (
+        MLP_Model, prep_data, train, evaluate_regression, evaluate_classification)
 
     feats = np.load(os.path.join(run_dir(run_id), _FEATURES))
     X_train, X_test = feats["X_train"], feats["X_test"]
     y_train, y_test = feats["y_train"], feats["y_test"]
+
+    # prepare_classes set task='classification': train MLP_Model with
+    # classifier_flag=True (LogSoftmax head over n_classes). Targets are int
+    # class indices and the loss is NLLLoss (CrossEntropyLoss would
+    # double-apply the log-softmax). Labels must be int64 for NLLLoss.
+    cls = _run_task(run_id) == "classification"
+    n_classes = 1
+    if cls:
+        manifest = _read_manifest(run_id)
+        n_classes = int(manifest.get("n_classes", 0))
+        if n_classes < 2:
+            raise ValueError(
+                f"Run {run_id!r} is a classification run but the manifest has "
+                f"no n_classes. Run prepare_classes first.")
+        y_train = np.asarray(y_train, dtype=np.int64)
+        y_test = np.asarray(y_test, dtype=np.int64)
 
     rd = os.path.abspath(run_dir(run_id))
     cwd = os.getcwd()
@@ -1455,13 +1861,14 @@ def train_mlp(
     os.chdir(rd)
     try:
         prep = prep_data(batch_size=32, shuffle=True, reduce_dim="pca",
-                         pca_var=0.95)
+                         pca_var=0.95, classifier_flag=cls)
         _, _, train_loader, _ = prep.create_data_loader(
             X_train, y_train, X_test, y_test)
         input_dims = int(prep.X_train.shape[1])
         model = MLP_Model(neurons=250, input_dims=input_dims,
-                          num_hidden_layers=1, skip_connection=True)
-        loss_fn = nn.MSELoss()
+                          num_hidden_layers=1, skip_connection=True,
+                          classifier_flag=cls, num_classes=n_classes)
+        loss_fn = nn.NLLLoss() if cls else nn.MSELoss()
         # Tuned config: SGD, lr=0.002, weight_decay=0.2 (PyTorch wd adds wd*w
         # to the gradient, so wd=0.2 ~ Keras L2=0.1).
         opt = torch.optim.SGD(model.parameters(), lr=0.002, weight_decay=0.2)
@@ -1470,7 +1877,8 @@ def train_mlp(
         epochs_run = 0
         for epoch in range(epochs):
             epochs_run = epoch + 1
-            epoch_loss = train(train_loader, model, loss_fn, opt)
+            epoch_loss = train(train_loader, model, loss_fn, opt,
+                               classifier_flag=cls, num_classes=n_classes)
             if epoch_loss < best_loss - min_delta:
                 best_loss = epoch_loss
                 stale = 0
@@ -1483,9 +1891,14 @@ def train_mlp(
                               f"best={best_loss:.7f})")
                     break
 
-        train_r2, test_r2 = evaluate_regression(
-            prep.X_train, np.asarray(y_train), prep.X_test,
-            np.asarray(y_test), model)
+        if cls:
+            train_acc, test_acc = evaluate_classification(
+                prep.X_train, y_train, prep.X_test, y_test, model)
+
+        else:
+            train_r2, test_r2 = evaluate_regression(
+                prep.X_train, np.asarray(y_train), prep.X_test,
+                np.asarray(y_test), model)
 
         model_path = os.path.join(rd, _MLP_MODEL)
         torch.save(model.state_dict(), model_path)
@@ -1493,6 +1906,30 @@ def train_mlp(
         prep.save_stats(prep_path)
     finally:
         os.chdir(cwd)
+
+    if cls:
+        manifest_path = _record_model(
+            run_id, "mlp", model_path,
+            mlp_prep_path=prep_path,
+            mlp_arch={"neurons": 250, "input_dims": input_dims,
+                      "num_hidden_layers": 1, "skip_connection": True,
+                      "classifier_flag": True, "num_classes": n_classes},
+            task="classification",
+            accuracy=float(test_acc),
+            accuracy_train=float(train_acc),
+            epochs_run=int(epochs_run))
+        publish_products(run_id, run_dir(run_id), _MLP_MODEL, _MLP_PREP,
+                         _MANIFEST)
+        return {
+            "run_id": run_id,
+            "model_type": "mlp",
+            "model_path": model_path,
+            "prep_path": prep_path,
+            "accuracy": float(test_acc),
+            "accuracy_train": float(train_acc),
+            "epochs_run": int(epochs_run),
+            "manifest_path": manifest_path,
+        }
 
     manifest_path = _record_model(
         run_id, "mlp", model_path,
@@ -1540,15 +1977,40 @@ def run_inference_mlp(run_id: str, smiles_list: list[str]) -> dict:
     manifest = _read_manifest(run_id)
     arch = manifest["mlp_arch"]
     rd = run_dir(run_id)
+    # classifier_flag=True models (mlp_arch records it) predict class indices;
+    # num_classes is needed to build the matching output layer.
+    cls_flag = bool(arch.get("classifier_flag", False))
+    n_classes = int(arch.get("num_classes", 1))
 
     prep = prep_data.load_stats(os.path.join(rd, _MLP_PREP))
     model = MLP_Model(neurons=arch["neurons"], input_dims=arch["input_dims"],
                       num_hidden_layers=arch["num_hidden_layers"],
+                      classifier_flag=cls_flag, num_classes=n_classes,
                       skip_connection=arch["skip_connection"])
     model.load_state_dict(torch.load(os.path.join(rd, _MLP_MODEL),
                                      weights_only=True))
     with open(manifest["featurizer_path"], "rb") as fh:
         featurizer = pickle.load(fh)
+
+    if cls_flag:
+        # Classification: argmax over the (n, n_classes) log-softmax outputs.
+        # Returns int class indices + the run's range labels; no log inversion.
+        preds = predict_single_value(model, featurizer, list(smiles_list),
+                                     prep=prep, verbose=False,
+                                     classifier_flag=True)
+        preds = np.asarray(preds, dtype=np.int64).reshape(-1)
+        pred_labels = class_label_strings(preds,
+                                          manifest.get("class_labels", []))
+        pred_path = _write_predictions_csv(run_id, smiles_list, preds,
+                                           pred_labels)
+        return {
+            "run_id": run_id,
+            "task": "classification",
+            "smiles": list(smiles_list),
+            "predicted_class": preds.tolist(),
+            "predicted_labels": pred_labels,
+            "predictions_csv": pred_path,
+        }
 
     inverse = (lambda p: np.power(10.0, p)) if manifest.get(
         "log_transformed", False) else None
@@ -1610,6 +2072,11 @@ def train_chemprop(
     that same space, and the manifest's log_transformed flag lets inference
     invert the log.
 
+    Classification runs (prepare_classes set task='classification'): targets
+    are the int class labels and the MPNN gets a MulticlassClassificationFFN
+    (CrossEntropyLoss) head; accuracy/balanced-accuracy/MCC/F1 are reported
+    instead of r2/mae.
+
     data.csv is the SAME file the fingerprint pipeline uses, so chemprop
     respects the row cap applied by prepare_chembl_csv (default 2000 rows);
     it does not bypass that limit.
@@ -1651,14 +2118,23 @@ def train_chemprop(
             f"{run_id!r} first.")
     df = pd.read_csv(data_csv)
     smiles = df["SMILES"].tolist()
-    targets = df["target"].to_numpy(dtype=float)
+    # Classification runs (prepare_classes set task='classification'): targets
+    # are the int class labels from data.csv; the MPNN gets a
+    # MulticlassClassificationFFN head.
+    cls = _run_task(run_id) == "classification"
+    if cls:
+        targets = df["class"].to_numpy(dtype=np.int64)
+        class_labels = _read_manifest(run_id).get("class_labels", [])
+        n_classes = int(_read_manifest(run_id).get("n_classes", 0))
+    else:
+        targets = df["target"].to_numpy(dtype=float)
 
     tr_smi, tr_y, va_smi, va_y, te_smi, te_y = _scaffold_train_val_test(
         smiles, targets)
 
     cd = chemprop_data()
     cd.load_pre_split(tr_smi, tr_y, va_smi, va_y, te_smi, te_y)
-    scaler = cd.featurize()
+    scaler = cd.featurize(classification=cls)
     train_loader, val_loader, test_loader = cd.make_loaders(batch_size=batch_size)
 
     # A from-scratch MPNN only (chemprop's standard small model: d_h=300,
@@ -1668,11 +2144,46 @@ def train_chemprop(
     # is kept intact for a possible future re-enable; train_chemprop simply
     # does not expose it.
     cm = chemprop_model()
-    cm.construct_model(scaler)
+    if cls:
+        cm.construct_classifier_model(n_classes)
+    else:
+        cm.construct_model(scaler)
     cm.train_model(
         train_loader, val_loader, epochs=epochs,
         checkpoint_dir=os.path.join(run_dir(run_id), "checkpoints"),
         accelerator=accelerator)
+
+    if cls:
+        # Multiclass head outputs softmax probabilities over n_classes; argmax
+        # -> class index; metrics computed post-hoc like the regression r2/mae.
+        probs = cm.get_class_probs(test_loader, accelerator=accelerator)
+        int_te_y = np.asarray(te_y, dtype=np.int64)
+        preds = probs.argmax(axis=1).astype(np.int64)
+        m = classification_metrics(int_te_y, preds)
+        model_path = os.path.join(run_dir(run_id), _CHEMPROP_MODEL)
+        cm.save_model(model_path)
+
+        manifest_path = _record_model(
+            run_id, "chemprop", model_path, task="classification",
+            n_classes=n_classes,
+            accuracy=m["accuracy"], balanced_accuracy=m["balanced_accuracy"],
+            mcc=m["mcc"], f1_macro=m["f1_macro"],
+            n_train=int(len(tr_smi)),
+            n_test=int(len(te_smi)))
+        publish_products(run_id, run_dir(run_id), _CHEMPROP_MODEL, _MANIFEST)
+        return {
+            "run_id": run_id,
+            "model_type": "chemprop",
+            "model_path": model_path,
+            "accuracy": m["accuracy"],
+            "balanced_accuracy": m["balanced_accuracy"],
+            "mcc": m["mcc"],
+            "f1_macro": m["f1_macro"],
+            "n_classes": n_classes,
+            "n_train": int(len(tr_smi)),
+            "n_test": int(len(te_smi)),
+            "manifest_path": manifest_path,
+        }
 
     preds = np.asarray(cm.get_preds(test_loader, accelerator=accelerator),
                        dtype=float)
@@ -1741,6 +2252,26 @@ def run_inference_chemprop(run_id: str, smiles_list: list[str],
 
     cm = chemprop_model()  # host instance; .mpnn is overridden by the load
     cm.mpnn = MPNN.load_from_file(os.path.join(rd, _CHEMPROP_MODEL))
+
+    # Classification runs: the MPNN head is MulticlassClassificationFFN, so
+    # predictions are softmax class probabilities -> argmax class index +
+    # range labels. No log transform.
+    if manifest.get("task") == "classification":
+        probs = cm.get_class_probs(loader, accelerator=accelerator)
+        pred_classes = probs.argmax(axis=1).astype(np.int64)
+        pred_labels = class_label_strings(pred_classes,
+                                          manifest.get("class_labels", []))
+        pred_path = _write_predictions_csv(run_id, smiles_list, pred_classes,
+                                           pred_labels)
+        return {
+            "run_id": run_id,
+            "task": "classification",
+            "smiles": list(smiles_list),
+            "predicted_class": pred_classes.tolist(),
+            "predicted_labels": pred_labels,
+            "predictions_csv": pred_path,
+        }
+
     preds = np.asarray(cm.get_preds(loader, accelerator=accelerator),
                        dtype=float).reshape(-1)
 

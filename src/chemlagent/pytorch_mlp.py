@@ -3,7 +3,7 @@ import torch.nn as nn
 from torch.utils.data import TensorDataset, DataLoader
 import numpy as np
 import warnings
-from sklearn.metrics import r2_score
+from sklearn.metrics import r2_score, accuracy_score
 import matplotlib.pyplot as plt
 
 from chemlagent.descriptor_cleaning import aggressive_cleaner
@@ -202,9 +202,45 @@ def evaluate_regression(X_train, y_train, X_test, y_test, model, device=device):
 
   return train_r2, test_r2
 
+def evaluate_classification(X_train, y_train, X_test, y_test, model, device=device):
+  '''
+    Evaluates a classifier_flag=True model on the training and test data.
+    Classifier counterpart of evaluate_regression (no scatter plot -- classes
+    don't have an identity line); accuracy replaces R^2. The model's output is
+    log-softmax over the classes (MLP_Model with classifier_flag=True), so the
+    predicted class is the argmax over that dimension.
+
+    Args:
+      X_train: training data (features, already preprocessed)
+      y_train: training class labels (ints 0..K-1)
+      X_test: test data
+      y_test: test class labels
+      model: model to evaluate
+      device: device to evaluate on (cpu or mps)
+    Returns:
+      train_acc: accuracy on the training data
+      test_acc: accuracy on the test data
+  '''
+  X_train = torch.as_tensor(X_train, dtype=torch.float32).to(device)
+  X_test = torch.as_tensor(X_test, dtype=torch.float32).to(device)
+  y_train = np.asarray(y_train, dtype=np.int64).reshape(-1)
+  y_test = np.asarray(y_test, dtype=np.int64).reshape(-1)
+
+  model.eval()
+  train_pred = model(X_train).detach().cpu().numpy().argmax(axis=1)
+  test_pred = model(X_test).detach().cpu().numpy().argmax(axis=1)
+
+  train_acc = accuracy_score(y_train, train_pred)
+  test_acc = accuracy_score(y_test, test_pred)
+  if print_flag:
+    print(f"Train Accuracy: {train_acc}")
+    print(f"Test Accuracy: {test_acc}")
+
+  return train_acc, test_acc
+
 def predict_single_value(model, fps, smiles_to_predict, prep=None,
                         truths=None, inverse_func=None, verbose=True,
-                        device=device):
+                        classifier_flag=False, device=device):
   '''
     Predicts values for a set of SMILES strings and (optionally) compares them
     to known targets. Mirrors evaluate_model in models.py: the fingerprints/
@@ -279,7 +315,12 @@ def predict_single_value(model, fps, smiles_to_predict, prep=None,
   model.eval()
   with torch.no_grad():
     prediction = model(temp_tensor)
-  predictions = prediction.detach().cpu().numpy().reshape(-1)
+  # classifier_flag=True models output (n, n_classes) log-softmax: the
+  # prediction is the argmax over the class dimension, not a continuous value.
+  if classifier_flag:
+    predictions = prediction.detach().cpu().numpy().argmax(axis=1)
+  else:
+    predictions = prediction.detach().cpu().numpy().reshape(-1)
 
   # Map predictions back to the original target space when the model was
   # trained on transformed targets (e.g. log10 -> power of 10).

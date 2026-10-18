@@ -1,9 +1,9 @@
-from sklearn.ensemble import RandomForestRegressor
-from lightgbm import LGBMRegressor
-from sklearn.svm import SVR
+from sklearn.ensemble import RandomForestRegressor, RandomForestClassifier
+from lightgbm import LGBMRegressor, LGBMClassifier
+from sklearn.svm import SVR, SVC
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import StandardScaler
-from sklearn.metrics import r2_score, mean_absolute_error
+from sklearn.metrics import r2_score, mean_absolute_error, accuracy_score
 import numpy as np
 
 from chemlagent.descriptor_cleaning import impute_only_cleaner
@@ -184,6 +184,81 @@ def svr_regression(X_train, y_train, X_test, y_test, pca_n_components=None,
     r2_train = r2_score(y_train, y_train_pred)
 
     return r2, r2_train, svr
+
+def random_forest_classifier(X_train, y_train, X_test, y_test, n_estimators=100,
+                             random_state=42):
+    """
+    Train and evaluate a Random Forest Classifier (classifier counterpart of
+    random_forest_regression; same signature/return contract, accuracy instead
+    of R^2). y values are int class indices.
+
+    Returns:
+      accuracy, accuracy_train (floats), fitted model
+    """
+    print(f'Testing with Random Forest Classifier '
+          f'(n_estimators={n_estimators}, random_state={random_state}).')
+    rf = RandomForestClassifier(n_estimators=n_estimators,
+                                random_state=random_state)
+    rf.fit(X_train, y_train)
+    y_train_pred = rf.predict(X_train)
+    y_pred = rf.predict(X_test)
+    return (accuracy_score(y_test, y_pred),
+            accuracy_score(y_train, y_train_pred), rf)
+
+def lightgbm_classifier(X_train, y_train, X_test, y_test, n_estimators=100,
+                        random_state=42, n_jobs=1):
+    """
+    Train and evaluate a LightGBM Classifier. n_jobs defaults to 1 for the
+    same libomp/MPS segfault reason as lightgbm_regression (see its docstring).
+
+    Returns:
+      accuracy, accuracy_train (floats), fitted model
+    """
+    print(f'Testing with LightGBM Classifier '
+          f'(n_estimators={n_estimators}, random_state={random_state}, '
+          f'n_jobs={n_jobs}).')
+    lgbm = LGBMClassifier(n_estimators=n_estimators, random_state=random_state,
+                          verbose=-1, n_jobs=n_jobs)
+    lgbm.fit(X_train, y_train)
+    y_train_pred = lgbm.predict(X_train)
+    y_pred = lgbm.predict(X_test)
+    return (accuracy_score(y_test, y_pred),
+            accuracy_score(y_train, y_train_pred), lgbm)
+
+def svc_classifier(X_train, y_train, X_test, y_test, pca_n_components=None,
+                   C=2.0, degree=3, coef0=2.0, gamma='scale'):
+    """
+    Train and evaluate a Support Vector Classifier with a third-degree
+    polynomial kernel -- the classifier counterpart of svr_regression. The
+    kernel defaults (C=2, degree=3, coef0=2) follow the poly-kernel SVC in
+    CafChemClassifiers.ridge_svm_methods. Like svr_regression, the returned
+    model is a sklearn Pipeline (impute-only clean -> StandardScaler -> [PCA]
+    -> SVC) fit on the TRAIN split only, so .predict works on raw Mordred
+    features of new molecules.
+
+    Returns:
+      accuracy, accuracy_train (floats), fitted Pipeline
+    """
+    tag = (f'PCA->{pca_n_components}, ' if pca_n_components is not None
+           else 'no PCA, ')
+    print(f'Testing with SVC ({tag}impute-only clean, poly kernel, '
+          f'degree={degree}, C={C}, coef0={coef0}, gamma={gamma}).')
+    steps = [
+        ('clean', impute_only_cleaner()),
+        ('scale', StandardScaler()),
+    ]
+    if pca_n_components is not None:
+        from sklearn.decomposition import PCA
+        steps.append(('pca', PCA(n_components=pca_n_components,
+                                 random_state=132)))
+    steps.append(('svc', SVC(kernel='poly', degree=degree, C=C, coef0=coef0,
+                             gamma=gamma)))
+    svc = Pipeline(steps)
+    svc.fit(X_train, y_train)
+    y_train_pred = svc.predict(X_train)
+    y_pred = svc.predict(X_test)
+    return (accuracy_score(y_test, y_pred),
+            accuracy_score(y_train, y_train_pred), svc)
 
 def evaluate_model(model, fps, new_smiles_list, new_targets):
     '''

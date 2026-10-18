@@ -180,16 +180,24 @@ class chemprop_data:
             print(f'Data loaded: train={len(self.train_data[0])} '
                   f'val={len(self.val_data[0])} test={len(self.test_data[0])}')
 
-    def featurize(self):
-        """Featurize to mol-graphs and normalize targets (train scaler reused
-        on val). Call ONCE; then build per-batch-size loaders with
-        make_loaders(). Returns the train StandardScaler (also wired into the
-        model's UnscaleTransform so predictions come back in raw nm).
-        """
+    def featurize(self, classification=False):
+        """Featurize to mol-graphs and (regression only) normalize targets
+        (train scaler reused on val). Call ONCE; then build per-batch-size
+        loaders with make_loaders(). Returns the train StandardScaler (also
+        wired into the model's UnscaleTransform so predictions come back in
+        raw nm), or None for classification runs -- class labels are long ints
+        for CrossEntropyLoss and must NOT be standardized."""
         featurizer = featurizers.SimpleMoleculeMolGraphFeaturizer()
         self.featurizer = featurizer
 
         self.train_dset = data.MoleculeDataset(self.train_data[0], featurizer)
+        if classification:
+            # Class indices: no target normalization, no scaler.
+            self.val_dset = data.MoleculeDataset(self.val_data[0], featurizer)
+            self.test_dset = data.MoleculeDataset(self.test_data[0], featurizer)
+            if print_flag:
+                print('Data featurized (classification; targets NOT normalized).')
+            return None
         scaler = self.train_dset.normalize_targets()
 
         self.val_dset = data.MoleculeDataset(self.val_data[0], featurizer)
@@ -332,6 +340,32 @@ class chemprop_model:
                                 final_lr=self.final_lr)
         return self.mpnn
 
+    def construct_classifier_model(self, n_classes):
+        """Assemble a multiclass-classification MPNN (classifier counterpart
+        of construct_model). Same message-passing/FFN hyperparameters; the
+        regression FFN is replaced with chemprop's MulticlassClassificationFFN
+        (CrossEntropyLoss). Targets are class-index ints so there is NO
+        UnscaleTransform and NO target scaler. All metrics are computed post-hoc
+        with sklearn (accuracy/MCC/F1) by the tool layer, matching how
+        construct_model's r2/mae are computed there."""
+        n_classes = int(n_classes)
+        if n_classes < 2:
+            raise ValueError(f"n_classes must be >= 2, got {n_classes}")
+        agg_out_dim = self.mp.output_dim + (1 if self.aggre == 'norm' else 0)
+        self.ffn = nn.MulticlassClassificationFFN(
+            n_classes=n_classes,
+            input_dim=agg_out_dim,
+            hidden_dim=self.ffn_hidden_dim,
+            n_layers=self.ffn_n_layers,
+            dropout=self.ffn_dropout,
+            criterion=nn.CrossEntropyLoss())
+        self.mpnn = models.MPNN(self.mp, self.agg, self.ffn, self.batch_norm,
+                                [],  # metrics=[]: scored post-hoc with sklearn
+                                warmup_epochs=self.warmup_epochs,
+                                init_lr=self.init_lr, max_lr=self.max_lr,
+                                final_lr=self.final_lr)
+        return self.mpnn
+
     def train_model(self, train_loader, val_loader, epochs=50, devices=1,
                     checkpoint_dir='checkpoints', accelerator='auto'):
         """Fit with a lightning Trainer; ModelCheckpoint keeps the best-val-loss
@@ -381,6 +415,23 @@ class chemprop_model:
             raw_preds = inftrainer.predict(self.mpnn, loader)
             _mps_empty_cache()
         return [float(v[0].item()) for sub in raw_preds for v in sub]
+
+    def get_class_probs(self, loader, accelerator='auto'):
+        """Run inference on a dataloader with a classification MPNN
+        (construct_classifier_model); return an (n_molecules, n_classes) array
+        of softmax class probabilities. ``get_preds`` can't be reused: it
+        flattens each row to a single float, only meaningful for the 1-output
+        regression head. Classification batches come back as (batch, classes)
+        (or (batch, 1, classes) tensors) -- rows are reshaped and stacked."""
+        with _stealth_mode():
+            with torch.inference_mode():
+                inftrainer = pl.Trainer(logger=None, enable_progress_bar=False,
+                                        accelerator=accelerator, devices=1)
+            raw_preds = inftrainer.predict(self.mpnn, loader)
+            _mps_empty_cache()
+        return np.concatenate(
+            [np.asarray(p, dtype=np.float64).reshape(len(p), -1)
+             for p in raw_preds], axis=0)
 
     def save_model(self, path):
         torch.save({'hyper_parameters': self.mpnn.hparams,

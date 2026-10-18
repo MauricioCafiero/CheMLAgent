@@ -55,6 +55,7 @@ TOOLS = [
     T.list_bioactives,
     T.search_targets,
     T.prepare_chembl_csv,
+    T.prepare_classes,
     T.featurize_fingerprints,
     T.train_model,
     T.grid_search,
@@ -99,6 +100,14 @@ log-transform the target are autodetected.
 2. featurize_fingerprints — featurize the dataset with a fingerprint type \
 (e.g. ECFP, Mordred, PubChem, MACCS) and scaffold-split it. Required before \
 train_model / train_mlp / dimension_reduction. Use the SAME run_id.
+2.5. prepare_classes — OPTIONAL classification switch: divides the target \
+into num_classes equal-count bands (classes 0..K-1 with range labels) and \
+turns the run into a CLASSIFICATION run. Call it after prepare_chembl_csv and \
+BEFORE featurize_fingerprints (and before train_chemprop). Run it only when \
+the user asks for a classifier / active-inactive or potency-class model; \
+afterwards every training/tuning/evaluation tool on that run_id trains and \
+reports CLASSIFIER versions (accuracy, balanced accuracy, MCC, macro-F1 \
+instead of R^2/MAE), including chemprop (Multiclass head) and the MLP.
 3. Train ONE model on that run (same run_id):
    - train_model — random_forest, lightgbm, or svr (on the fingerprints).
    - train_mlp — PyTorch MLP (on the fingerprints).

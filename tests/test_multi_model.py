@@ -6,9 +6,11 @@ overwrote the manifest's single ``model_type`` flag, stranding the first
 model: e.g. train LightGBM after an MLP and ``evaluate_model`` could no
 longer score the LightGBM model even though its file was still on disk.
 
-Uses a synthetic features.npz (no RDKit / featurize step) so the test is
-fast and focused on the manifest + dispatch logic. Run from a clean CWD
-under tmp_path so runs/ is isolated.
+Uses the REAL pipeline (tests/conftest.py): prepare_chembl_csv +
+featurize_fingerprints ECFP on a slice of the repo's ChEMBL CSV, featurized
+once per module; the module-scoped seeded_run fixture switches CWD to a
+per-module tmp dir so runs/ is isolated. Focus stays on the manifest +
+dispatch logic.
 """
 
 import os
@@ -17,31 +19,6 @@ import numpy as np
 import pytest
 
 from chemlagent import tools as T
-
-
-@pytest.fixture
-def seeded_run(tmp_path, monkeypatch):
-    """A run_id with synthetic features.npz + a seeded manifest.
-
-    Target is a linear function of the features so RF and LightGBM both fit
-    well enough for the finite-r2 asserts to be meaningful.
-    """
-    monkeypatch.chdir(tmp_path)
-    run_id = "multitest"
-    rng = np.random.default_rng(0)
-    n = 200
-    X = rng.normal(0, 1, size=(n, 20))
-    w = rng.normal(0, 1, size=20)
-    y = X @ w + 0.05 * rng.normal(size=n)
-    idx = rng.permutation(n)
-    n_tr = 160
-    Xtr, Xte = X[idx[:n_tr]], X[idx[n_tr:]]
-    ytr, yte = y[idx[:n_tr]], y[idx[n_tr:]]
-    d = T.run_dir(run_id)  # creates runs/multitest
-    np.savez(os.path.join(d, T._FEATURES),
-             X_train=Xtr, X_test=Xte, y_train=ytr, y_test=yte)
-    T._write_manifest(run_id, {"run_id": run_id, "fp_type": "synthetic"})
-    return run_id
 
 
 def test_two_sklearn_models_coexist_and_evaluate(seeded_run):
