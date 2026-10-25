@@ -23,6 +23,10 @@ infers each tool's JSON schema from the function signature + docstring, so the
 prepare_chembl_csv  ──►  featurize_fingerprints  ──►  train_model   ──►  evaluate_model
   (CSV / ChEMBL ID)        (fingerprints /           (RF / LightGBM /      (held-out test)
   ← or input_csv directly   descriptors)              SVR)
+        │                       ▲
+        └──► prepare_classes ───┘   (optional: turns the run into a
+             (target → K equal-       CLASSIFICATION run; every tool
+              count classes)          downstream trains/reports classifiers)
                                                    ──►  grid_search        ──►  run_inference(_mlp/_chemprop)
                                                        (5-fold CV over a          (small hyperparameter grid,
                                                         same run_id)               refits + saves best)
@@ -74,6 +78,20 @@ currently inactive — see [CheMeleon foundation model](#chemeleon-foundation-mo
   `canonical_smi`, etc., and `IC50`/`pIC50`/`EC50`/`Ki`/`Kd`/`Lmax`/`λ_max`/
   `potency`/…). A log10 transform is autodetected when the target range is
   ≥ 1000 (e.g. nM IC50); inference inverts it automatically.
+- **Classify instead of regress (optional)** — `prepare_classes(run_id,
+  num_classes)` bins the target into `num_classes` approximately equal-count
+  bands (rows sorted by target, cut every `n // num_classes` rows; default 2 =
+  active/inactive), strips common counter-ions (`[Na+]`, `[Cl-]`, `[K+]`,
+  `[Br-]`, `[I-]`, `[Ca2+]`) from the SMILES, and writes two columns back to
+  `data.csv`: `class` (int 0..K-1) and `class_labels` (range strings like
+  `"4.1 < 5.6"`). It sets `task: "classification"` plus `n_classes` /
+  `class_labels` in the manifest, and **every downstream tool keys off that
+  flag** — `featurize_fingerprints`, `train_model`, `grid_search`, `mlp_scan`,
+  `train_mlp`, `train_chemprop`, `evaluate_model` and all three inference tools
+  train and report the classifier versions (see the classifier table below).
+  Call it **after** `prepare_chembl_csv` and **before** `featurize_fingerprints`
+  / `train_chemprop`. The returned `num_classes` is the actual count — it can
+  be one fewer than requested if band cutoffs collide on tied target values.
 - **Featurize** — fingerprints & descriptors via scikit-fingerprints, then a
   Murcko-scaffold train/test split. 2D types run on the molecular graph; 3D
   types generate conformers first. Pass `fp_type` (case-insensitive) to
@@ -119,8 +137,25 @@ currently inactive — see [CheMeleon foundation model](#chemeleon-foundation-mo
   | `mlp_scan`        | PyTorch wide-and-deep MLP      | fingerprints      | 5-fold-CV scan over a SMALL grid; refits + saves best (see below) |
   | `train_mlp`       | PyTorch wide-and-deep MLP      | fingerprints      | SGD/lr/weight-decay/batch tuned internally             |
   | `train_chemprop`  | Chemprop MPNN                  | molecular graphs  | from-scratch MPNN only (CheMeleon foundation wired but inactive — see below) |
+
+  On a **classification run** (after `prepare_classes`) the same tools swap in
+  the classifier counterpart automatically — no different tool names or
+  arguments:
+
+  | tool / `model_type`          | classifier used                                                    |
+  |------------------------------|--------------------------------------------------------------------|
+  | `train_model` `random_forest`| `RandomForestClassifier`                                           |
+  | `train_model` `lightgbm`     | `LGBMClassifier` (`n_jobs=1`, libomp)                              |
+  | `train_model` `svr`          | poly-kernel `SVC` (C=2, degree=3, coef0=2) in the same impute → scale pipeline |
+  | `grid_search`                | the three classifiers above, CV-scored on accuracy                 |
+  | `train_mlp` / `mlp_scan`     | same wide-and-deep MLP with a K-way LogSoftmax head (NLL loss), argmax at inference |
+  | `train_chemprop`             | MPNN with a `MulticlassClassificationFFN` head (cross-entropy)     |
+
 - **Evaluate & infer** — metrics on the held-out split; predictions for new
-  SMILES in original units.
+  SMILES in original units. Classification runs report **accuracy, balanced
+  accuracy, MCC, macro-F1 and a row-normalized confusion matrix** instead of
+  R²/MAE, and inference returns `predicted_class` (int indices) plus
+  `predicted_labels` (the range strings) with no log inversion.
 
 ## Requirements
 
@@ -219,6 +254,17 @@ when the CheMeleon foundation path was still active; with the from-scratch
 MPNN that `train_chemprop` now uses, expect somewhat lower R² at the same
 epoch count.)*
 
+Or, as a classifier:
+
+> Use the local CSV `CHEMBL220_bioactives.csv`. Prepare it with
+> `run_id=ache_cls`, then split the target into 3 classes. Featurize with ECFP,
+> train a random forest classifier, and report accuracy, MCC and the class
+> ranges. Then predict the class of `CCOc1ccc(cc1)C(=O)NC`.
+
+The agent calls `prepare_chembl_csv → prepare_classes(num_classes=3) →
+featurize_fingerprints → train_model → evaluate_model → run_inference`; the
+prediction comes back as a class index and its range label.
+
 ## Tools
 
 Each is a plain function in `src/chemlagent/tools.py` with a numpydoc docstring
@@ -230,6 +276,7 @@ that doubles as the Ollama tool schema.
 | `search_uniprot`         | `protein_names`; `human_only` (default `False`)           |
 | `list_bioactives`        | `uniprot_ids`; `activity_type` (default `IC50`)           |
 | `prepare_chembl_csv`     | `chembl_id` *or* `input_csv`; `limit`, `units`, `activity_type` |
+| `prepare_classes`        | `num_classes` (default 2) — optional; makes the run a classification run |
 | `featurize_fingerprints` | `fp_type` (default `ECFP`), `test_size`                   |
 | `train_model`            | `model_type` (`random_forest`/`lightgbm`/`svr`), `n_estimators` |
 | `grid_search`            | `model_type`, `param_grid` (dict; capped at 3 values/param, 6 combos total) |
@@ -257,7 +304,9 @@ the Apple-Silicon libomp double-load segfault, and only whitelisted params are
 accepted: `random_forest` {n_estimators, max_depth, min_samples_leaf,
 max_features}, `lightgbm` {n_estimators, num_leaves, learning_rate,
 min_child_samples}, `svr` {C, gamma, epsilon} (the poly kernel's degree=2 /
-coef0=7 stay fixed). Chemprop is not yet covered by any scan tool.
+coef0=7 stay fixed). Chemprop is not yet covered by any scan tool. On a
+classification run the `svr` grid targets the SVC instead (degree=3 / coef0=2
+fixed), so only `C` and `gamma` apply — `epsilon` is an SVR-only parameter.
 
 `mlp_scan` is the MLP counterpart: it exposes a bounded grid of MLP
 hyperparameters (`neurons`, `num_hidden_layers`, `lr`, `weight_decay`,
@@ -336,21 +385,32 @@ Paths resolve from `recent_work/<run_id>/` by the known filenames for each
 model type, so it works whether or not the manifest's path fields were
 rewritten at quit.
 
+> **Classifier runs are not yet supported here.** `reload.py` (and therefore
+> the REPL `/predict` keyword) predates the classifier pipeline: it ignores the
+> manifest's `task` field, so for a classification run it returns raw class
+> indices with no range labels — and if the source data was log-transformed it
+> wrongly applies `10**` to them; the chemprop/MLP classifiers are also loaded
+> through the regression paths. Use the agent's `run_inference*` tools for
+> classifier predictions until this is fixed. (`reload list` / `/models` also
+> show only R²/MAE columns, so classifier runs list with blank metrics.)
+
 ## Project layout
 
 ```
 src/chemlagent/
   agent.py              Ollama dispatch loop + CLI
-  tools.py              the 15 Ollama-callable tool functions (3 discovery + 12 pipeline)
+  tools.py              16 Ollama-callable tool functions (3 discovery + 13 pipeline)
+  shell.py              the sandboxed `shell` tool (17th tool)
   data.py               CSV prep (local + ChEMBL), column/log autodetect
   fingerprints.py       scikit-fingerprints wrappers + scaffold split
-  models.py             RF / LightGBM / SVR + evaluate
+  classify.py           prepare_classes binning, counter-ion stripping, classification metrics
+  models.py             RF / LightGBM / SVR regressors + RF / LightGBM / SVC classifiers + evaluate
   pytorch_mlp.py        wide-and-deep PyTorch MLP
   chemprop_model.py     Chemprop MPNN data + model classes
   descriptor_cleaning.py  impute / aggressive feature cleaners
   products.py            publish products to recent_work/ + list them on quit
   reload.py              deterministic model reload + inference from recent_work/
-tests/test_smoke.py     end-to-end MVP round-trip on synthetic data
+tests/                  pytest suite on real ChEMBL data (see Tests)
 runs/<run_id>/          working run artifacts (gitignored, regenerable)
 recent_work/<run_id>/   curated products copied out as stages complete (gitignored)
 ```
@@ -361,11 +421,25 @@ recent_work/<run_id>/   curated products copied out as stages complete (gitignor
 uv run pytest
 ```
 
-`test_smoke.py` exercises `prepare → featurize → train (RF) → evaluate` on
-synthetic data, so the tools are verifiable without hitting Ollama.
-`test_grid_search.py`, `test_mlp_scan.py`, and `test_dimension_reduction.py`
-cover the bounded-CV scan tools and the EDA projection tool respectively;
-`test_multi_model.py` covers the multi-model run plumbing.
+The whole suite runs on **real data** without hitting Ollama: `conftest.py`
+featurizes a 200-row ECFP slice of the bundled `CHEMBL220_bioactives.csv` once
+per test module, from a tmp CWD so `runs/` and `recent_work/` stay isolated
+(tests skip if the CSV is missing). Slow models are tested too, with shrunk
+configs (1-epoch CPU chemprop, short MLP runs) rather than excluded.
+
+| file                                | covers                                                     |
+|-------------------------------------|------------------------------------------------------------|
+| `test_smoke.py`                     | `prepare → featurize → train (RF) → evaluate` round trip   |
+| `test_grid_search.py`               | bounded-CV `grid_search`                                   |
+| `test_mlp_scan.py`                  | bounded-CV `mlp_scan`                                      |
+| `test_dimension_reduction.py`       | PCA / t-SNE EDA projection                                 |
+| `test_multi_model.py`               | several model types on one run                             |
+| `test_classification_real_data.py`  | `prepare_classes` + RF / SVC / LightGBM grid / MLP / `mlp_scan` classifier round trips |
+| `test_chemprop.py`                  | chemprop regression **and** classifier: train → evaluate → inference |
+| `test_shell.py`                     | the sandboxed `shell` tool                                 |
+
+`tests/cls_e2e_check.py` is a manual (non-pytest) end-to-end script for the
+classifier pipeline, run directly with `uv run python tests/cls_e2e_check.py`.
 
 ## Notes
 
