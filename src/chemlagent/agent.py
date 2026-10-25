@@ -277,17 +277,18 @@ def _is_run_id(token: str) -> bool:
 def _print_models_table(models: list[dict]) -> None:
     """Print the saved-runs table with a 1-based row index for selection."""
     table = Table(title="Saved models in recent_work/", show_lines=False)
-    for col in ("#", "run_id", "model_type", "fp_type", "is_foundation",
-                "r2", "mae", "n_train", "n_test", "log_transformed"):
+    for col in ("#", "run_id", "model_type", "task", "fp_type", "is_foundation",
+                "r2", "mae", "accuracy", "n_train", "n_test", "log_transformed"):
         table.add_column(col)
     for i, m in enumerate(models, 1):
         table.add_row(
             str(i), str(m["run_id"]), str(m["model_type"]),
-            str(m.get("fp_type") or "-"),
+            str(m.get("task") or "-"), str(m.get("fp_type") or "-"),
             str(m.get("is_foundation") if m.get("is_foundation") is not None
                 else "-"),
             f"{m['r2']:.3f}" if m.get("r2") is not None else "-",
             f"{m['mae']:.2f}" if m.get("mae") is not None else "-",
+            f"{m['accuracy']:.3f}" if m.get("accuracy") is not None else "-",
             str(m.get("n_train") or "-"), str(m.get("n_test") or "-"),
             str(m.get("log_transformed")))
     console.print(table)
@@ -394,11 +395,10 @@ def _do_predict(state: dict, args: list[str]) -> None:
                       "[cyan]--csv <file>[/cyan].")
         return
     try:
-        preds = lm.predict(smiles)
+        out_df = lm.predict_df(smiles)
     except Exception as exc:
         console.print(f"[red]predict error:[/red] {exc!r}")
         return
-    out_df = pd.DataFrame({"SMILES": smiles, "prediction": preds})
     if out:
         out_df.to_csv(out, index=False)
         console.print(f"[green]wrote[/green] {len(out_df)} predictions "

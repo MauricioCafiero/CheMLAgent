@@ -385,14 +385,11 @@ Paths resolve from `recent_work/<run_id>/` by the known filenames for each
 model type, so it works whether or not the manifest's path fields were
 rewritten at quit.
 
-> **Classifier runs are not yet supported here.** `reload.py` (and therefore
-> the REPL `/predict` keyword) predates the classifier pipeline: it ignores the
-> manifest's `task` field, so for a classification run it returns raw class
-> indices with no range labels — and if the source data was log-transformed it
-> wrongly applies `10**` to them; the chemprop/MLP classifiers are also loaded
-> through the regression paths. Use the agent's `run_inference*` tools for
-> classifier predictions until this is fixed. (`reload list` / `/models` also
-> show only R²/MAE columns, so classifier runs list with blank metrics.)
+Classification runs are handled too: the reloader reads the manifest's
+`task` (per model, so a run holding both kinds dispatches correctly) and
+returns `predicted_class` + `predicted_label` columns with no log inversion,
+building the MLP's K-way head and chemprop's multiclass head as needed. `list`
+(and `/models`) show a `task` column and `accuracy` alongside `r2`/`mae`.
 
 ## Project layout
 

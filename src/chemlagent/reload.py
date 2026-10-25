@@ -10,7 +10,9 @@ manifest). This module lets you use them without going through Ollama:
     <SMILES...>`` reload a model and predict for new SMILES, dispatching on the
     manifest's ``model_type`` (random_forest / lightgbm / svr / mlp / chemprop).
     Log-transform inversion is applied per the manifest, so predictions come
-    back in original units.
+    back in original units. Classification runs (manifest ``task`` =
+    'classification', set by prepare_classes) return int class indices plus
+    their range labels instead, with no log inversion.
 
 Paths resolve from the ``recent_work/<run_id>/`` directory directly (by the
 known filenames for each model type), so this works whether or not the
@@ -48,8 +50,9 @@ def list_available_models(root: str | None = None) -> list[dict]:
     """Inventory the saved runs under ``recent_work/``.
 
     Returns one dict per run (sorted by run_id) with: run_id, model_type,
-    models (list of all types trained on the run), is_foundation, fp_type, r2,
-    mae, n_train, n_test, log_transformed, and the absolute directory path.
+    models (list of all types trained on the run), task, is_foundation,
+    fp_type, r2, mae, accuracy (classification runs), n_train, n_test,
+    log_transformed, and the absolute directory path.
     Runs without a manifest are skipped.
     """
     base = recent_work_path() if root is None else root
@@ -70,10 +73,12 @@ def list_available_models(root: str | None = None) -> list[dict]:
             "run_id": run_id,
             "model_type": m.get("model_type"),
             "models": sorted(m.get("models", {}).keys()),
+            "task": m.get("task", "regression"),
             "is_foundation": m.get("is_foundation"),
             "fp_type": m.get("fp_type"),
             "r2": m.get("r2"),
             "mae": m.get("mae"),
+            "accuracy": m.get("accuracy"),
             "n_train": m.get("n_train"),
             "n_test": m.get("n_test"),
             "log_transformed": m.get("log_transformed"),
@@ -93,6 +98,8 @@ class LoadedModel:
     model_type: str
     log_transformed: bool
     run_dir: str
+    task: str = "regression"
+    class_labels: list = field(default_factory=list)
     model: object = None
     featurizer: object = None
     prep: object = None
@@ -127,6 +134,10 @@ class LoadedModel:
         # (so a non-active model on a multi-model run loads its OWN file), else
         # the flat manifest (active model / older runs).
         record = manifest.get("models", {}).get(model_type, manifest)
+        # The model's own task wins over the manifest-level one (a run can hold
+        # both a regression and a classification model; see tools._run_task).
+        self.task = record.get("task") or manifest.get("task", "regression")
+        self.class_labels = manifest.get("class_labels", [])
 
         if model_type in ("random_forest", "lightgbm", "svr"):
             sklearn_file = os.path.basename(
@@ -161,6 +172,8 @@ class LoadedModel:
         try:
             model = MLP_Model(neurons=arch["neurons"], input_dims=arch["input_dims"],
                               num_hidden_layers=arch["num_hidden_layers"],
+                              classifier_flag=bool(arch.get("classifier_flag", False)),
+                              num_classes=int(arch.get("num_classes", 1)),
                               skip_connection=arch["skip_connection"])
         finally:
             os.chdir(cwd)
@@ -184,11 +197,24 @@ class LoadedModel:
     # -- inference -----------------------------------------------------------
 
     def predict(self, smiles_list: list[str]) -> np.ndarray:
-        """Predict the target for SMILES in original units (log inverted)."""
+        """Predict the target for SMILES in original units (log inverted).
+
+        For classification runs, returns int class indices (no log inversion);
+        map them to range labels with ``self.class_labels`` or use
+        :meth:`predict_df`.
+        """
         smiles_list = list(smiles_list)
+        cls = self.task == "classification"
         if self.model_type in ("random_forest", "lightgbm", "svr"):
             X = self.featurizer.transform(smiles_list)
             preds = np.asarray(self.model.predict(X), dtype=float).reshape(-1)
+        elif self.model_type == "mlp" and cls:
+            from chemlagent.pytorch_mlp import predict_single_value
+            return np.asarray(
+                predict_single_value(self.model, self.featurizer, smiles_list,
+                                     prep=self.prep, verbose=False,
+                                     classifier_flag=True),
+                dtype=np.int64).reshape(-1)
         elif self.model_type == "mlp":
             from chemlagent.pytorch_mlp import predict_single_value
             inverse = (lambda p: np.power(10.0, p)) if self.log_transformed else None
@@ -199,12 +225,29 @@ class LoadedModel:
             return preds  # already in original units
         elif self.model_type == "chemprop":
             loader = self.featurizer.make_new_dataloader(smiles_list, batch_size=64)
+            if cls:
+                return self.model.get_class_probs(loader).argmax(axis=1).astype(np.int64)
             preds = np.asarray(self.model.get_preds(loader), dtype=float).reshape(-1)
         else:
             raise ValueError(f"Unknown model_type {self.model_type!r}")
+        if cls:
+            return preds.astype(np.int64)
         if self.log_transformed:
             preds = np.power(10.0, preds)
         return preds
+
+    def predict_df(self, smiles_list: list[str]) -> pd.DataFrame:
+        """Predict and return a table: SMILES + prediction (regression), or
+        SMILES + predicted_class + predicted_label (classification) -- the same
+        columns the agent's run_inference tools write to predictions.csv."""
+        smiles_list = list(smiles_list)
+        preds = self.predict(smiles_list)
+        if self.task == "classification":
+            return pd.DataFrame({
+                "SMILES": smiles_list,
+                "predicted_class": preds,
+                "predicted_label": [self.class_labels[int(c)] for c in preds]})
+        return pd.DataFrame({"SMILES": smiles_list, "prediction": preds})
 
 
 # --- CLI -------------------------------------------------------------------
@@ -222,15 +265,17 @@ def _print_table(models: list[dict]) -> None:
         console.print("[dim]No saved models in recent_work/.[/dim]")
         return
     table = Table(title="Saved models in recent_work/", show_lines=False)
-    for col in ("run_id", "model_type", "fp_type", "is_foundation",
-                "r2", "mae", "n_train", "n_test", "log_transformed"):
+    for col in ("run_id", "model_type", "task", "fp_type", "is_foundation",
+                "r2", "mae", "accuracy", "n_train", "n_test", "log_transformed"):
         table.add_column(col)
     for m in models:
         table.add_row(
-            str(m["run_id"]), str(m["model_type"]), str(m.get("fp_type") or "-"),
+            str(m["run_id"]), str(m["model_type"]), str(m.get("task") or "-"),
+            str(m.get("fp_type") or "-"),
             str(m.get("is_foundation") if m.get("is_foundation") is not None else "-"),
             f"{m['r2']:.3f}" if m.get("r2") is not None else "-",
             f"{m['mae']:.2f}" if m.get("mae") is not None else "-",
+            f"{m['accuracy']:.3f}" if m.get("accuracy") is not None else "-",
             str(m.get("n_train") or "-"), str(m.get("n_test") or "-"),
             str(m.get("log_transformed")))
     console.print(table)
@@ -263,8 +308,7 @@ def main(argv=None) -> int:
         if not smiles:
             parser.error("provide SMILES on the CLI or with --csv")
         lm = LoadedModel.load(args.run_id)
-        preds = lm.predict(smiles)
-        out = pd.DataFrame({"SMILES": smiles, "prediction": preds})
+        out = lm.predict_df(smiles)
         if args.out:
             out.to_csv(args.out, index=False)
             print(f"wrote {len(out)} predictions to {args.out}")

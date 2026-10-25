@@ -16,6 +16,8 @@ import numpy as np
 import pytest
 
 from chemlagent import tools as T
+from chemlagent.products import relocate_all_runs
+from chemlagent.reload import LoadedModel, list_available_models
 
 _SMIS = ["CCOc1ccc(cc1)C(=O)NC", "O=C(O)c1ccccc1OC(C)C"]
 
@@ -64,6 +66,20 @@ def test_classification_round_trip_real_data(real_csv, tmp_path,
     assert len(inf["predicted_class"]) == 2
     assert len(inf["predicted_labels"]) == 2
     assert all(c in (0, 1, 2) for c in inf["predicted_class"])
+
+    # Deterministic reload from recent_work/ (the /predict path) agrees with
+    # the agent tool: int classes + range labels, no 10** inversion even
+    # though the CHEMBL220 IC50s were log-transformed. relocate_all_runs is
+    # the quit step that moves featurizer.pkl into recent_work/.
+    relocate_all_runs()
+    lm = LoadedModel.load(run_id)
+    assert lm.task == "classification"
+    df = lm.predict_df(_SMIS)
+    assert df["predicted_class"].tolist() == inf["predicted_class"]
+    assert df["predicted_label"].tolist() == inf["predicted_labels"]
+    listed = {m["run_id"]: m for m in list_available_models()}[run_id]
+    assert listed["task"] == "classification"
+    assert listed["accuracy"] == trained["accuracy"]
 
 
 @pytest.fixture(scope="module")
@@ -139,6 +155,13 @@ def test_mlp_classifier_round_trip(cls_models):
     inf = T.run_inference_mlp(run_id=run_id, smiles_list=_SMIS)
     assert all(c in (0, 1, 2) for c in inf["predicted_class"])
     assert all(" < " in lab for lab in inf["predicted_labels"])
+
+    # Reload builds the classifier MLP head from mlp_arch and argmaxes. Read
+    # from runs/ (not relocated): mlp_scan still needs this shared run.
+    df = LoadedModel.load(run_id, model_type="mlp",
+                          root="runs").predict_df(_SMIS)
+    assert df["predicted_class"].tolist() == inf["predicted_class"]
+    assert df["predicted_label"].tolist() == inf["predicted_labels"]
 
 
 def test_mlp_scan_classifier(cls_models):

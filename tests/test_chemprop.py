@@ -14,6 +14,7 @@ import numpy as np
 import pytest
 
 from chemlagent import tools as T
+from chemlagent.reload import LoadedModel
 
 _SMIS = ["CCOc1ccc(cc1)C(=O)NC", "O=C(O)c1ccccc1OC(C)C"]
 
@@ -102,3 +103,9 @@ def test_chemprop_classifier_round_trip(cls_run):
     assert len(inf["predicted_labels"]) == 2
     assert all(c in (0, 1, 2) for c in inf["predicted_class"])
     assert all(" < " in lab for lab in inf["predicted_labels"])
+
+    # Reload (the /predict path) uses the classifier head too. It runs on the
+    # default accelerator, not the CPU used above, so only check validity.
+    df = LoadedModel.load(run_id).predict_df(_SMIS)
+    assert all(c in (0, 1, 2) for c in df["predicted_class"])
+    assert all(" < " in lab for lab in df["predicted_label"])
