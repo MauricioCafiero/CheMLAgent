@@ -8,7 +8,8 @@ manifest). This module lets you use them without going through Ollama:
     inventory the saved runs (model type, metrics, foundation flag, paths).
   * :func:`LoadedModel.load` / ``python -m chemlagent.reload predict <run_id>
     <SMILES...>`` reload a model and predict for new SMILES, dispatching on the
-    manifest's ``model_type`` (random_forest / lightgbm / svr / mlp / chemprop).
+    manifest's ``model_type`` (random_forest / lightgbm / svr / gp / mlp /
+    chemprop).
     Log-transform inversion is applied per the manifest, so predictions come
     back in original units. Classification runs (manifest ``task`` =
     'classification', set by prepare_classes) return int class indices plus
@@ -139,7 +140,7 @@ class LoadedModel:
         self.task = record.get("task") or manifest.get("task", "regression")
         self.class_labels = manifest.get("class_labels", [])
 
-        if model_type in ("random_forest", "lightgbm", "svr"):
+        if model_type in ("random_forest", "lightgbm", "svr", "gp"):
             sklearn_file = os.path.basename(
                 record.get("model_path") or manifest.get("model_path")
                 or _SKLEARN_FALLBACK)
@@ -205,7 +206,7 @@ class LoadedModel:
         """
         smiles_list = list(smiles_list)
         cls = self.task == "classification"
-        if self.model_type in ("random_forest", "lightgbm", "svr"):
+        if self.model_type in ("random_forest", "lightgbm", "svr", "gp"):
             X = self.featurizer.transform(smiles_list)
             preds = np.asarray(self.model.predict(X), dtype=float).reshape(-1)
         elif self.model_type == "mlp" and cls:

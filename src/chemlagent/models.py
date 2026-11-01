@@ -4,6 +4,11 @@ from sklearn.svm import SVR, SVC
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import StandardScaler
 from sklearn.metrics import r2_score, mean_absolute_error, accuracy_score
+from sklearn.gaussian_process import GaussianProcessRegressor
+from sklearn.gaussian_process.kernels import (Kernel, ConstantKernel, RBF,
+                                              WhiteKernel)
+from sklearn.exceptions import ConvergenceWarning
+import warnings
 import numpy as np
 
 from chemlagent.descriptor_cleaning import impute_only_cleaner
@@ -15,7 +20,7 @@ from chemlagent.descriptor_cleaning import impute_only_cleaner
 print_flag = False
 
 def random_forest_regression(X_train, y_train, X_test, y_test, n_estimators=100,
-                             random_state=42):
+                             random_state=42, n_jobs=None):
     """
     Train and evaluate a Random Forest Regressor.
     
@@ -40,7 +45,7 @@ def random_forest_regression(X_train, y_train, X_test, y_test, n_estimators=100,
     print(f'Testing with Random Forest Regressor '
           f'(n_estimators={n_estimators}, random_state={random_state}).')
     rf = RandomForestRegressor(n_estimators=n_estimators,
-                               random_state=random_state)
+                               random_state=random_state, n_jobs=n_jobs)
     
     rf.fit(X_train, y_train)
     
@@ -184,6 +189,106 @@ def svr_regression(X_train, y_train, X_test, y_test, pca_n_components=None,
     r2_train = r2_score(y_train, y_train_pred)
 
     return r2, r2_train, svr
+
+class TanimotoKernel(Kernel):
+    """Tanimoto (Jaccard) similarity kernel for fingerprint features:
+    k(x, y) = x.y / (|x|^2 + |y|^2 - x.y). Exact Tanimoto on binary bits, the
+    dot-product generalization on counts. Parameter-free and positive
+    semi-definite; scale it with a ConstantKernel."""
+
+    def __init__(self):  # sklearn kernels need an explicit (here empty) signature
+        pass
+
+    def __call__(self, X, Y=None, eval_gradient=False):
+        X = np.asarray(X, dtype=np.float64)
+        Y = X if Y is None else np.asarray(Y, dtype=np.float64)
+        xy = X @ Y.T
+        denom = (X * X).sum(1)[:, None] + (Y * Y).sum(1)[None, :] - xy
+        K = np.divide(xy, denom, out=np.zeros_like(xy), where=denom > 0)
+        if eval_gradient:
+            return K, np.empty((X.shape[0], X.shape[0], 0))
+        return K
+
+    def diag(self, X):
+        return np.ones(np.asarray(X).shape[0])
+
+    def is_stationary(self):
+        return False
+
+
+def _looks_like_fingerprint(X):
+    """True if X is all finite, non-negative integers (fingerprint bits/counts)."""
+    X = np.asarray(X, dtype=np.float64)
+    return bool(np.all(np.isfinite(X)) and np.all(X >= 0)
+                and np.array_equal(X, np.round(X)))
+
+
+def gaussian_process_regression(X_train, y_train, X_test, y_test, kernel='auto',
+                                random_state=42):
+    """
+    Train and evaluate a Gaussian process regressor, which also gives a
+    per-molecule predictive uncertainty (std).
+
+    Two kernels, chosen to match the featurization:
+      * 'tanimoto' -- ConstantKernel * Tanimoto + WhiteKernel on fingerprint
+        bits/counts (ECFP, Atom_Pair, MACCS, PubChem, ...). No scaling.
+      * 'rbf' -- ConstantKernel * RBF + WhiteKernel on continuous descriptors
+        (RDKit_2D, Mordred, EState, ...), after the same impute-only clean +
+        StandardScaler step the SVR uses (fit on TRAIN only).
+      * 'auto' (default) -- 'tanimoto' if the features are all non-negative
+        integers, else 'rbf'.
+    Amplitude, noise (and the RBF length scale) are fit by maximizing the
+    marginal likelihood; targets are normalized internally (normalize_y).
+
+    An exact GP costs O(n^3) in the training-set size: fine up to several
+    thousand molecules (CHEMBL220's ~4800 train fit in seconds to a minute),
+    slow beyond ~10-15k.
+
+    Parameters:
+    -----------
+    X_train, y_train, X_test, y_test : array-like
+        Train/test features and targets.
+    kernel : {'auto', 'tanimoto', 'rbf'}, default 'auto'
+    random_state : int, default 42
+
+    Returns:
+    --------
+    r2 : float
+        R^2 score on the test set
+    r2_train : float
+        R^2 score on the training set
+    gp : sklearn.pipeline.Pipeline
+        Fitted ([clean -> scale ->] GP) pipeline. .predict(X) gives the mean;
+        .predict(X, return_std=True) also returns the predictive std.
+    """
+    if kernel == 'auto':
+        kernel = 'tanimoto' if _looks_like_fingerprint(X_train) else 'rbf'
+    print(f'Testing with Gaussian Process Regressor (kernel={kernel}, '
+          f'random_state={random_state}).')
+    if kernel == 'tanimoto':
+        k = (ConstantKernel(1.0, (1e-4, 1e2)) * TanimotoKernel()
+             + WhiteKernel(0.3, (1e-5, 1e1)))
+        steps = []
+    elif kernel == 'rbf':
+        n_features = np.asarray(X_train).shape[1]
+        k = (ConstantKernel(1.0, (1e-4, 1e2))
+             * RBF(np.sqrt(n_features), (1e-2, 1e4))
+             + WhiteKernel(0.3, (1e-5, 1e1)))
+        steps = [('clean', impute_only_cleaner()), ('scale', StandardScaler())]
+    else:
+        raise ValueError(f"kernel must be 'auto', 'tanimoto' or 'rbf', got {kernel!r}")
+    steps.append(('gp', GaussianProcessRegressor(k, normalize_y=True,
+                                                 random_state=random_state)))
+    gp = Pipeline(steps)
+    with warnings.catch_warnings():
+        # Hyperparameters hitting a bound is informative, not an error.
+        warnings.simplefilter('ignore', ConvergenceWarning)
+        gp.fit(X_train, y_train)
+
+    r2 = r2_score(y_test, gp.predict(X_test))
+    r2_train = r2_score(y_train, gp.predict(X_train))
+    return r2, r2_train, gp
+
 
 def random_forest_classifier(X_train, y_train, X_test, y_test, n_estimators=100,
                              random_state=42):

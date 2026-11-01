@@ -46,3 +46,12 @@ def test_pipeline_round_trip(real_csv, tmp_path, monkeypatch):
 
     # manifest should carry flags from both data prep and featurize stages.
     assert os.path.exists(os.path.join("runs", run_id, "manifest.json"))
+
+def test_clean_smiles_strips_all_salt_forms():
+    from chemlagent.fingerprints import clean_smiles
+    salts = ["CC1=CC2Cc3nc4cc(Cl)ccc4c(N)c3C(C1)C2.Cl.Cl",   # HCl as neutral Cl
+             "C[N+](C)(C)CCOC(C)=O.[Br-]",                   # ionic counter-ion
+             "c1ccccc1N.F[B-](F)(F)F",                        # BF4-
+             "CCN.O"]                                          # water
+    assert all("." not in s for s in clean_smiles(salts))
+    assert clean_smiles(["CCO", "c1ccccc1"]) == ["CCO", "c1ccccc1"]  # untouched

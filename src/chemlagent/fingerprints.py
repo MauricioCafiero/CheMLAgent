@@ -16,9 +16,10 @@ from skfp.fingerprints import (
 )
 from sklearn.model_selection import GridSearchCV
 from sklearn.metrics import r2_score
-from rdkit import Chem
+from rdkit import Chem, rdBase
 from rdkit.Chem import Descriptors
 from rdkit.Chem.Scaffolds import MurckoScaffold
+from rdkit.Chem.MolStandardize import rdMolStandardize
 import numpy as np
 
 # Broadcast print flag: the agent sets chemlagent.fingerprints.print_flag =
@@ -50,7 +51,7 @@ class SmilesFeaturizer:
     self.n_jobs = n_jobs
 
   def transform(self, smiles_list):
-    mols = MolFromSmilesTransformer().transform(smiles_list)
+    mols = MolFromSmilesTransformer().transform(clean_smiles(smiles_list))
     if self.is_3d:
       if self.many_conf:
         conf_gen = ConformerGenerator(num_conformers=self.num_confs,
@@ -162,15 +163,23 @@ def scaffold_train_test_split(molecules, targets, test_size=0.2, random_state=No
 
 def clean_smiles(smiles_list: list[str]):
   '''
+  Strip counter-ions / solvent from salt SMILES by keeping the largest
+  fragment (RDKit LargestFragmentChooser). Catches every salt form, including
+  the neutral HCl/HBr written as '.Cl' / '.Br', BF4-, mesylate, TFA and water
+  that a fixed ion list misses. Single-fragment SMILES are returned unchanged;
+  unparseable SMILES are passed through for the featurizer to handle.
   '''
-  ions_to_clean = ['[Na+].', '[Cl-].', '[Ca+].', '[K+].', '.[Na+]', '.[Cl-]', '.[Ca+]', '.[K+]', '[Br-].', '[I-].', '[F-].',
-                   '.[Br-]', '.[I-]', '.[F-]']
-  clean_smiles = []
-  for smiles in smiles_list:
-    for ion in ions_to_clean:
-      smiles = smiles.replace(ion,"")
-    clean_smiles.append(smiles)
-  return clean_smiles
+  chooser = rdMolStandardize.LargestFragmentChooser()
+  cleaned = []
+  # BlockLogs: the chooser logs several INFO lines per salt molecule.
+  with rdBase.BlockLogs():
+    for smiles in smiles_list:
+      if '.' in smiles:
+        mol = Chem.MolFromSmiles(smiles)
+        if mol is not None:
+          smiles = Chem.MolToSmiles(chooser.choose(mol))
+      cleaned.append(smiles)
+  return cleaned
 
 class get_fingerprints():
   '''
@@ -194,7 +203,7 @@ class get_fingerprints():
       self.y = target_list
     
     mols_from_smiles = MolFromSmilesTransformer()
-    self.mols_raw = mols_from_smiles.transform(smiles_list)
+    self.mols_raw = mols_from_smiles.transform(self.smiles_list)
 
     self.types_3d = ['E3FP', 'Autocorr', 'MORSE', 'RDF']
     self.types_2d = ['ECFP', 'Atom_Pair', 'Mordred', 'RDKit_2D', 'MACCS', 'PubChem', 'EState']
@@ -220,7 +229,8 @@ class get_fingerprints():
         'RDF': (RDFFingerprint(n_jobs=self.n_jobs),{})
     }
 
-  def create(self, fp_type: str = 'Mordred', many_conf = True, num_confs = 5, test_size = 0.2):
+  def create(self, fp_type: str = 'Mordred', many_conf = True, num_confs = 5, test_size = 0.2,
+             split_seed: int = 132):
     '''
     '''
     self.fp_type = fp_type
@@ -240,7 +250,7 @@ class get_fingerprints():
     self.fp = self.fp_hash[self.fp_type][0]
 
     self.mols_train, self.mols_test, self.y_train, self.y_test = scaffold_train_test_split(
-        self.mols, self.y, test_size=test_size, random_state=132)
+        self.mols, self.y, test_size=test_size, random_state=split_seed)
   
     self.X_train = self.fp.transform(self.mols_train)
     self.X_test = self.fp.transform(self.mols_test)
@@ -256,7 +266,7 @@ class get_fingerprints():
     self.new_smiles_list = clean_smiles(smiles_list)
 
     mols_from_smiles = MolFromSmilesTransformer()
-    self.new_mols_raw = mols_from_smiles.transform(smiles_list)
+    self.new_mols_raw = mols_from_smiles.transform(self.new_smiles_list)
 
     if self.fp_type in self.types_3d:
       if self.many_conf:

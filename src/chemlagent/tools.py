@@ -46,6 +46,7 @@ from chemlagent.models import (
     random_forest_regression,
     lightgbm_regression,
     svr_regression,
+    gaussian_process_regression,
     random_forest_classifier,
     lightgbm_classifier,
     svc_classifier,
@@ -130,9 +131,15 @@ _MODEL_ALIASES = {
     "randomforest": "random_forest",
     "lightgbm": "lightgbm", "lgbm": "lightgbm",
     "svr": "svr",
+    "gp": "gp", "gaussian_process": "gp", "gpr": "gp",
     "mlp": "mlp",
     "chemprop": "chemprop",
 }
+
+
+# Model types saved as a pickled sklearn estimator/Pipeline (model_<type>.pkl)
+# and served by evaluate_model / run_inference's sklearn path.
+_SKLEARN_TYPES = ("random_forest", "lightgbm", "svr", "gp")
 
 
 def _canonical_model_type(model_type: str) -> str:
@@ -142,7 +149,7 @@ def _canonical_model_type(model_type: str) -> str:
     if canonical is None:
         raise ValueError(
             f"Unknown model_type {model_type!r}. Use 'random_forest', "
-            f"'lightgbm', 'svr', 'mlp', or 'chemprop'.")
+            f"'lightgbm', 'svr', 'gp', 'mlp', or 'chemprop'.")
     return canonical
 
 
@@ -189,11 +196,12 @@ def _run_task(run_id: str, record: dict | None = None) -> str:
 
 
 def _write_predictions_csv(run_id: str, smiles_list, preds,
-                           pred_labels=None) -> str:
+                           pred_labels=None, lower95=None, upper95=None) -> str:
     """Write (SMILES, prediction) to runs/<run_id>/predictions.csv and publish
     it to recent_work/. Returns the predictions CSV path. For classification
     (pred_labels given) the columns are predicted_class (int indices) +
-    predicted_label (range strings) instead of the float prediction."""
+    predicted_label (range strings) instead of the float prediction. For a GP,
+    lower95/upper95 add the 95% predictive-interval bounds as two columns."""
     path = os.path.join(run_dir(run_id), "predictions.csv")
     if pred_labels is not None:
         pd.DataFrame({"SMILES": list(smiles_list),
@@ -201,9 +209,12 @@ def _write_predictions_csv(run_id: str, smiles_list, preds,
                       "predicted_label": list(pred_labels)}
                      ).to_csv(path, index=False)
     else:
-        pd.DataFrame({"SMILES": list(smiles_list),
-                      "prediction": np.asarray(preds, dtype=float).reshape(-1)}
-                     ).to_csv(path, index=False)
+        cols = {"SMILES": list(smiles_list),
+                "prediction": np.asarray(preds, dtype=float).reshape(-1)}
+        if lower95 is not None:
+            cols["lower95"] = np.asarray(lower95, dtype=float).reshape(-1)
+            cols["upper95"] = np.asarray(upper95, dtype=float).reshape(-1)
+        pd.DataFrame(cols).to_csv(path, index=False)
     publish_products(run_id, run_dir(run_id), "predictions.csv", "manifest.json")
     return path
 
@@ -614,12 +625,21 @@ def train_model(
     avoid the Apple-Silicon/MPS segfault. Only the model type and (for the tree
     models) the estimator count are exposed, to keep tool calls simple.
 
+    'gp' is a Gaussian process (regression only). On fingerprints (ECFP etc.)
+    it uses a Tanimoto kernel -- the best model tested on CHEMBL220 (scaffold
+    test R2 ~0.61 vs ~0.55 for RF on the same ECFP) -- and on continuous
+    descriptors an RBF kernel on standardized features. Its hyperparameters are
+    fit automatically; it also gives a 95% prediction interval at inference.
+    Exact GP: suited to datasets up to several thousand molecules.
+
     Args:
         run_id: Pipeline run identifier; reads features.npz, writes
             model_<model_type>.pkl and updates manifest.json.
-        model_type: One of 'random_forest', 'lightgbm', or 'svr'.
+        model_type: One of 'random_forest', 'lightgbm', 'svr', or 'gp'
+            (Gaussian process, regression runs only; aliases
+            'gaussian_process', 'gpr').
         n_estimators: Number of trees/estimators for random_forest and
-            lightgbm (default 100). Ignored for svr.
+            lightgbm (default 100). Ignored for svr and gp.
 
     Returns:
         dict with keys: run_id, model_type, model_path, r2, r2_train,
@@ -667,10 +687,18 @@ def train_model(
         else:
             r2, r2_train, model = svr_regression(
                 X_train, y_train, X_test, y_test)
+    elif model_type == "gp":
+        if cls:
+            raise ValueError(
+                "model_type 'gp' supports regression runs only; this run is a "
+                "classification run (prepare_classes). Use random_forest, "
+                "lightgbm, or svr.")
+        r2, r2_train, model = gaussian_process_regression(
+            X_train, y_train, X_test, y_test)
     else:
         raise ValueError(
             f"Unknown model_type {model_type!r}. Use 'random_forest', "
-            f"'lightgbm', or 'svr'.")
+            f"'lightgbm', 'svr', or 'gp'.")
 
     # Per-type filename so training a second sklearn model on the same run
     # never overwrites a first (e.g. train random_forest then lightgbm and both
@@ -1482,7 +1510,7 @@ def evaluate_model(run_id: str, model_type: str | None = None) -> dict:
 
     Dispatches on the model type:
 
-      - random_forest / lightgbm / svr: unpickle the model's
+      - random_forest / lightgbm / svr / gp: unpickle the model's
         runs/<run_id>/model_<type>.pkl and call .predict on the raw test
         features (the sklearn path).
       - mlp: load the torch state_dict (mlp_model.pt) + the saved train-time
@@ -1503,7 +1531,7 @@ def evaluate_model(run_id: str, model_type: str | None = None) -> dict:
             and features.npz (sklearn/mlp), or manifest.json (chemprop).
         model_type: Optional. Which trained model to evaluate: 'random_forest'
             (aliases 'rf', 'randomforest'), 'lightgbm' (alias 'lgbm'), 'svr',
-            'mlp', or 'chemprop'. If omitted, evaluates the run's active
+            'gp', 'mlp', or 'chemprop'. If omitted, evaluates the run's active
             (most-recently-trained) model. Raises a helpful error naming the
             available types if the requested one was never trained on the run.
 
@@ -1541,7 +1569,7 @@ def evaluate_model(run_id: str, model_type: str | None = None) -> dict:
     else:
         truths = np.asarray(y_test, dtype=float).reshape(-1)
 
-    if model_type in ("random_forest", "lightgbm", "svr"):
+    if model_type in _SKLEARN_TYPES:
         with open(record["model_path"], "rb") as fh:
             model = pickle.load(fh)
         preds = np.asarray(model.predict(X_test), dtype=float).reshape(-1)
@@ -1579,7 +1607,7 @@ def evaluate_model(run_id: str, model_type: str | None = None) -> dict:
     else:
         raise ValueError(
             f"Cannot evaluate run {run_id!r}: manifest model_type is "
-            f"{model_type!r} (expected random_forest/lightgbm/svr/mlp/"
+            f"{model_type!r} (expected random_forest/lightgbm/svr/gp/mlp/"
             f"chemprop). Train a model for this run first.")
 
     if cls:
@@ -1698,8 +1726,9 @@ def run_inference(run_id: str, smiles_list: list[str],
     inverted.
 
     This tool covers the sklearn fingerprint models (random_forest / lightgbm /
-    svr). For an MLP use run_inference_mlp; for a Chemprop MPNN use
-    run_inference_chemprop.
+    svr / gp). For an MLP use run_inference_mlp; for a Chemprop MPNN use
+    run_inference_chemprop. A gp model also returns a 95% prediction interval
+    (lower95 / upper95, in original units) per molecule.
 
     Args:
         run_id: Pipeline run identifier; reads model_<type>.pkl,
@@ -1707,7 +1736,7 @@ def run_inference(run_id: str, smiles_list: list[str],
         smiles_list: List of SMILES strings to predict for.
         model_type: Optional. Which trained sklearn model to predict with:
             'random_forest' (aliases 'rf', 'randomforest'), 'lightgbm' (alias
-            'lgbm'), or 'svr'. If omitted, uses the run's active
+            'lgbm'), 'svr', or 'gp'. If omitted, uses the run's active
             (most-recently-trained) model. Raises a helpful error naming the
             available types if the requested one was never trained on the run,
             or points to run_inference_mlp / run_inference_chemprop if a
@@ -1715,7 +1744,8 @@ def run_inference(run_id: str, smiles_list: list[str],
 
     Returns:
         dict with keys: run_id, log_transformed, predictions (list[float], in
-        original units), smiles (list[str], the input echoed back).
+        original units), smiles (list[str], the input echoed back); for gp also
+        lower95 / upper95 (list[float], 95% interval bounds, original units).
     """
     print("Run inference tool")
     print("=" * 55)
@@ -1725,7 +1755,7 @@ def run_inference(run_id: str, smiles_list: list[str],
         record = manifest
     else:
         model_type = _canonical_model_type(model_type)
-        if model_type not in ("random_forest", "lightgbm", "svr"):
+        if model_type not in _SKLEARN_TYPES:
             raise ValueError(
                 f"run_inference covers the sklearn fingerprint models only; "
                 f"got {model_type!r}. For an MLP use run_inference_mlp, for a "
@@ -1733,7 +1763,7 @@ def run_inference(run_id: str, smiles_list: list[str],
         models = manifest.get("models", {})
         if model_type not in models:
             available = sorted(t for t in models
-                               if t in ("random_forest", "lightgbm", "svr"))
+                               if t in _SKLEARN_TYPES)
             raise ValueError(
                 f"Run {run_id!r} has no trained {model_type!r} model. "
                 f"Available sklearn model type(s): {available or 'none'}.")
@@ -1744,7 +1774,13 @@ def run_inference(run_id: str, smiles_list: list[str],
         featurizer = pickle.load(fh)
 
     X = featurizer.transform(smiles_list)
-    preds = np.asarray(model.predict(X), dtype=float).reshape(-1)
+    lower = upper = None
+    if model_type == "gp":
+        preds, sd = model.predict(X, return_std=True)
+        lower, upper = preds - 1.96 * sd, preds + 1.96 * sd
+    else:
+        preds = model.predict(X)
+    preds = np.asarray(preds, dtype=float).reshape(-1)
 
     # Classification runs: predictions are int class indices -> range labels.
     # No log transform / no original-unit inversion for classes.
@@ -1770,15 +1806,22 @@ def run_inference(run_id: str, smiles_list: list[str],
     log_transformed = manifest.get("log_transformed", False)
     if log_transformed:
         preds = np.power(10.0, preds)
+        if lower is not None:
+            lower, upper = np.power(10.0, lower), np.power(10.0, upper)
 
-    pred_path = _write_predictions_csv(run_id, smiles_list, preds)
-    return {
+    pred_path = _write_predictions_csv(run_id, smiles_list, preds,
+                                       lower95=lower, upper95=upper)
+    out = {
         "run_id": run_id,
         "log_transformed": bool(log_transformed),
         "smiles": list(smiles_list),
         "predictions": preds.tolist(),
         "predictions_csv": pred_path,
     }
+    if lower is not None:
+        out["lower95"] = np.asarray(lower, dtype=float).tolist()
+        out["upper95"] = np.asarray(upper, dtype=float).tolist()
+    return out
 
 
 # --- MLP (PyTorch) ---------------------------------------------------------

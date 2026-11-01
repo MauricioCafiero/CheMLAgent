@@ -77,3 +77,9 @@ Thumbs.db
 *.swp
 *.swo
 *~
+# Experiment outputs (regenerable by the scripts in experiments/)
+experiments/results/
+
+# User scratch EDA files (never committed)
+CafChemEDA.py
+EDA_CafChem.ipynb

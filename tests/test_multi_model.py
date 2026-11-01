@@ -105,3 +105,41 @@ def test_relocate_keeps_all_trained_models(seeded_run):
         assert rec["model_path"].startswith(
             os.path.join(P.RECENT_WORK_DIR, run_id))
         assert os.path.exists(rec["model_path"])
+
+def test_gp_trains_evaluates_and_gives_interval(seeded_run, real_csv):
+    import pickle
+    import pandas as pd
+    from chemlagent.reload import LoadedModel
+
+    # Own run (same real-data slice, same tmp CWD as seeded_run): the shared
+    # 'real' run is moved out of runs/ by test_relocate_keeps_all_trained_models.
+    run_id = "gp_run"
+    T.prepare_chembl_csv(input_csv=real_csv, run_id=run_id, limit=200)
+    T.featurize_fingerprints(run_id=run_id, fp_type="ECFP")
+    out = T.train_model(run_id=run_id, model_type="gaussian_process")
+    assert out["model_type"] == "gp"
+    assert out["model_path"].endswith("model_gp.pkl")
+    assert np.isfinite(out["r2"])
+
+    # ECFP bits -> kernel='auto' must pick the Tanimoto kernel.
+    with open(out["model_path"], "rb") as fh:
+        gp = pickle.load(fh)
+    assert "Tanimoto" in str(gp[-1].kernel_)
+
+    ev = T.evaluate_model(run_id=run_id, model_type="gp")
+    assert np.isfinite(ev["r2"]) and len(ev["predictions"]) == ev["n_test"]
+
+    smiles = ["CCO", "c1ccccc1O", "CN1CCC[C@H]1c1cccnc1"]
+    inf = T.run_inference(run_id=run_id, smiles_list=smiles, model_type="gp")
+    lo, pred, hi = (np.array(inf[k]) for k in ("lower95", "predictions", "upper95"))
+    assert len(pred) == len(smiles)
+    assert np.all(lo < pred) and np.all(pred < hi)
+    csv = pd.read_csv(inf["predictions_csv"])
+    assert {"lower95", "upper95"} <= set(csv.columns)
+
+    # Quit-time relocation must keep model_gp.pkl + featurizer.pkl, and the
+    # deterministic reload from recent_work/ must predict the same values.
+    from chemlagent import products as P
+    P.relocate_all_runs(runs_root="runs")
+    lm = LoadedModel.load(run_id, model_type="gp")
+    np.testing.assert_allclose(lm.predict(smiles), pred, rtol=1e-6)

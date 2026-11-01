@@ -109,7 +109,10 @@ afterwards every training/tuning/evaluation tool on that run_id trains and \
 reports CLASSIFIER versions (accuracy, balanced accuracy, MCC, macro-F1 \
 instead of R^2/MAE), including chemprop (Multiclass head) and the MLP.
 3. Train ONE model on that run (same run_id):
-   - train_model — random_forest, lightgbm, or svr (on the fingerprints).
+   - train_model — random_forest, lightgbm, svr, or gp (on the fingerprints). \
+gp = Gaussian process, regression runs only; with ECFP fingerprints it was \
+the most accurate model tested, and run_inference then also returns a 95% \
+prediction interval (lower95 / upper95).
    - train_mlp — PyTorch MLP (on the fingerprints).
    - train_chemprop — Chemprop MPNN on molecular graphs (reads data.csv \
 directly; trains a small from-scratch MPNN). No \

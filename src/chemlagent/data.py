@@ -231,6 +231,17 @@ def prepare_chembl_csv(
 
     n_before = len(df)
     df = df.dropna(subset=["SMILES", "target"])
+    # Strip salts to the parent molecule and canonicalize BEFORE de-duplicating,
+    # so a salt and its free base (or two SMILES spellings of one molecule)
+    # collapse to a single row. Unparseable SMILES are kept as-is.
+    from rdkit import Chem, rdBase
+    from chemlagent.fingerprints import clean_smiles
+    with rdBase.BlockLogs():
+        canon = []
+        for s in clean_smiles(df["SMILES"].astype(str).tolist()):
+            mol = Chem.MolFromSmiles(s)
+            canon.append(Chem.MolToSmiles(mol) if mol is not None else s)
+    df = df.assign(SMILES=canon)
     df = df.drop_duplicates(subset=["SMILES"], keep="last")
     # Coerce the target to float, DROPPING rows that don't parse instead of
     # raising "could not convert string to float". An input_csv target column

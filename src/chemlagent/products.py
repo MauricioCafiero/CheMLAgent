@@ -27,6 +27,7 @@ _KEEP_BY_MODEL: dict[str, tuple[str, ...]] = {
     "random_forest": ("model_random_forest.pkl", "featurizer.pkl"),
     "lightgbm": ("model_lightgbm.pkl", "featurizer.pkl"),
     "svr": ("model_svr.pkl", "featurizer.pkl"),
+    "gp": ("model_gp.pkl", "featurizer.pkl"),
     "mlp": ("mlp_model.pt", "mlp_prep.npz", "featurizer.pkl"),
     "chemprop": ("chemprop_model.pt",),
 }

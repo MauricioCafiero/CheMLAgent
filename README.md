@@ -133,6 +133,7 @@ currently inactive — see [CheMeleon foundation model](#chemeleon-foundation-mo
   | `train_model`     | Random Forest                  | fingerprints/descriptors | `model_type=random_forest`, `n_estimators` tunable |
   | `train_model`     | LightGBM                       | fingerprints/descriptors | `model_type=lightgbm`                               |
   | `train_model`     | SVR                            | fingerprints/descriptors | `model_type=svr`, literature-tuned poly kernel     |
+  | `train_model`     | Gaussian process               | fingerprints/descriptors | `model_type=gp`, regression only; Tanimoto kernel on fingerprints, RBF on descriptors; inference adds a 95% interval (see below) |
   | `grid_search`     | RF / LightGBM / SVR            | fingerprints/descriptors | 5-fold CV over a small grid; refits + saves best (see below) |
   | `mlp_scan`        | PyTorch wide-and-deep MLP      | fingerprints      | 5-fold-CV scan over a SMALL grid; refits + saves best (see below) |
   | `train_mlp`       | PyTorch wide-and-deep MLP      | fingerprints      | SGD/lr/weight-decay/batch tuned internally             |
@@ -147,6 +148,7 @@ currently inactive — see [CheMeleon foundation model](#chemeleon-foundation-mo
   | `train_model` `random_forest`| `RandomForestClassifier`                                           |
   | `train_model` `lightgbm`     | `LGBMClassifier` (`n_jobs=1`, libomp)                              |
   | `train_model` `svr`          | poly-kernel `SVC` (C=2, degree=3, coef0=2) in the same impute → scale pipeline |
+  | `train_model` `gp`           | not supported — raises an error; use one of the classifiers above  |
   | `grid_search`                | the three classifiers above, CV-scored on accuracy                 |
   | `train_mlp` / `mlp_scan`     | same wide-and-deep MLP with a K-way LogSoftmax head (NLL loss), argmax at inference |
   | `train_chemprop`             | MPNN with a `MulticlassClassificationFFN` head (cross-entropy)     |
@@ -278,7 +280,7 @@ that doubles as the Ollama tool schema.
 | `prepare_chembl_csv`     | `chembl_id` *or* `input_csv`; `limit`, `units`, `activity_type` |
 | `prepare_classes`        | `num_classes` (default 2) — optional; makes the run a classification run |
 | `featurize_fingerprints` | `fp_type` (default `ECFP`), `test_size`                   |
-| `train_model`            | `model_type` (`random_forest`/`lightgbm`/`svr`), `n_estimators` |
+| `train_model`            | `model_type` (`random_forest`/`lightgbm`/`svr`/`gp`), `n_estimators` |
 | `grid_search`            | `model_type`, `param_grid` (dict; capped at 3 values/param, 6 combos total) |
 | `mlp_scan`               | `param_grid` (dict; capped at 3 values/param, 6 combos total), `cv_folds` (default 5) |
 | `dimension_reduction`    | `method` (`pca`/`tsne`), `color_by` (`target`/`split`/`classes`), `num_classes`, `remove_outliers` |
@@ -289,6 +291,30 @@ that doubles as the Ollama tool schema.
 | `train_chemprop`         | `epochs` (default 30), `batch_size`, `accelerator`       |
 | `run_inference_chemprop` | `smiles_list`                                             |
 | `shell`                  | `command` — sandboxed cross-platform mini-shell (`pwd`, `cd`, `ls`, `mkdir`, `find`, `cat`, `head`, `tail`, `wc`, `grep`); lives in `src/chemlagent/shell.py`. Lets the agent discover existing CSVs and per-run artifacts (under `runs/` and `recent_work/`) before creating anything new. No real shell is spawned; access is jailed to the repo, and there is no `rm`/`mv`/`cp` |
+
+### Gaussian process (`model_type=gp`)
+
+`models.gaussian_process_regression` picks its kernel from the features:
+a **Tanimoto** kernel on fingerprint bits/counts (ECFP, Atom_Pair, MACCS, ...)
+or an **RBF** kernel on continuous descriptors (RDKit_2D, Mordred, ...) after
+the SVR's impute → standardize step. Amplitude, noise (and RBF length scale)
+are fit by marginal likelihood, so there is nothing to tune. `run_inference`
+returns `lower95` / `upper95` bounds per molecule (also written to
+`predictions.csv`), back-transformed to original units on log-target runs.
+
+Benchmark (`experiments/gp_vs_rf.py`, 5 scaffold splits, test R², mean ± sd):
+
+| dataset                 | RF + RDKit_2D | RF + ECFP   | GP + RDKit_2D | GP + ECFP (Tanimoto) |
+|-------------------------|---------------|-------------|---------------|----------------------|
+| CHEMBL220 (log IC50)    | 0.500 ± 0.02  | 0.546 ± 0.05| 0.501 ± 0.04  | **0.612 ± 0.06**     |
+| 621-azo (Lmax)          | 0.710 ± 0.13  | 0.616 ± 0.14| 0.700 ± 0.12  | **0.719 ± 0.10**     |
+
+GP + ECFP beat RF + ECFP on all 10 splits and the best RF on all 5 CHEMBL220
+splits; on the small azo set it ties the best RF. The 95% intervals cover
+91–93% of test values (slightly over-confident), and the predicted std is only
+weakly rank-correlated with the actual error (Spearman 0.10–0.30). Exact GP
+cost is O(n³): a ~4800-molecule fit takes ~20 s; expect it to get slow past
+~10–15k molecules.
 
 Arguments are deliberately minimal to keep tool calls well-formed. Hyperparameters
 that aren't exposed use tuned internal defaults (e.g. the SVR poly kernel, the
@@ -365,7 +391,7 @@ deterministic reload CLI below (`predict --csv`).
 
 `src/chemlagent/reload.py` lets you reuse a run's products straight from
 `recent_work/<run_id>/` without going through the agent. It dispatches on the
-manifest's `model_type` (random_forest / lightgbm / svr / mlp / chemprop) and
+manifest's `model_type` (random_forest / lightgbm / svr / gp / mlp / chemprop) and
 applies the manifest's log-transform inversion, so predictions are in original
 units.
 
@@ -401,7 +427,7 @@ src/chemlagent/
   data.py               CSV prep (local + ChEMBL), column/log autodetect
   fingerprints.py       scikit-fingerprints wrappers + scaffold split
   classify.py           prepare_classes binning, counter-ion stripping, classification metrics
-  models.py             RF / LightGBM / SVR regressors + RF / LightGBM / SVC classifiers + evaluate
+  models.py             RF / LightGBM / SVR / GP regressors + RF / LightGBM / SVC classifiers + evaluate
   pytorch_mlp.py        wide-and-deep PyTorch MLP
   chemprop_model.py     Chemprop MPNN data + model classes
   descriptor_cleaning.py  impute / aggressive feature cleaners
@@ -458,7 +484,7 @@ projects; the real chemistry and ML heavy lifting is theirs:
 |------------------------------------------------------|-------------------------------------------|
 | [RDKit](https://www.rdkit.org/)                      | SMILES parsing, descriptors, Murcko scaffolds, conformer generation |
 | [scikit-fingerprints](https://github.com/dfpl/scikit-fingerprints) | the fingerprint/descriptor estimators behind `featurize_fingerprints` |
-| [scikit-learn](https://scikit-learn.org/)            | Random Forest, SVR, PCA, StandardScaler, metrics |
+| [scikit-learn](https://scikit-learn.org/)            | Random Forest, SVR, Gaussian process, PCA, StandardScaler, metrics |
 | [LightGBM](https://lightgbm.readthedocs.io/)         | gradient-boosted trees model               |
 | [PyTorch](https://pytorch.org/)                      | the wide-and-deep MLP                     |
 | [Chemprop](https://chemprop.org/)                   | message-passing neural network for molecular graphs |
