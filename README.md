@@ -42,6 +42,9 @@ featurize_fingerprints  ──►  dimension_reduction   (optional EDA)
                               (PCA / t-SNE 2D projection
                                + scatter plot of the
                                featurized matrix)
+                         ──►  cluster_molecules     (optional EDA)
+                              (k-means auto-k / HDBSCAN;
+                               cluster quality vs target)
 ```
 
 The discovery tools are optional — use them when the request gives a protein
@@ -103,6 +106,16 @@ currently inactive — see [CheMeleon foundation model](#chemeleon-foundation-mo
   (`dim_reduction_<method>_<fp_type>.png`), colored by target value, train/test
   split, or target-derived class. Different fingerprints produce different
   files (keyed by method + fp_type); recoloring overwrites the same projection.
+- **EDA / clustering** — `cluster_molecules` groups the featurized molecules
+  (train + test, unsupervised; standardized, PCA ≤ 50 comps for k-means, ≤ 10 for HDBSCAN) with **k-means**
+  (`n_clusters=0` → k at the inertia elbow over 2..`max_clusters`) or
+  **HDBSCAN** (finds its own clusters; low-density molecules → noise `-1`).
+  Clusters are scored against the target as in Toney et al. (Chem. Sci. 2026):
+  `u_test_frac` (fraction of cluster pairs with significantly different target
+  distributions, Mann–Whitney p < 0.05), Davies–Bouldin and Calinski–Harabasz
+  indices on the target, plus feature-space silhouette. Writes
+  `clusters_<method>_<fp_type>.csv` (SMILES, split, target, cluster); then
+  `dimension_reduction(color_by='clusters')` plots them.
 
   The `fp_type` values accepted by `featurize_fingerprints` (and thus by
   `dimension_reduction`):
@@ -122,6 +135,17 @@ currently inactive — see [CheMeleon foundation model](#chemeleon-foundation-mo
   | `Autocorr`         | 3D descriptor  | 3D autocorrelation descriptors                                               |
   | `MORSE`            | 3D descriptor  | 3D Molecule Representation of Structures based on Electron diffraction      |
   | `RDF`              | 3D descriptor  | radial distribution function descriptors                                     |
+  | `Spectral`         | 3D descriptor  | spectral graph-Laplacian eigenvalues from generated conformers               |
+  | `Spectral_2D`      | descriptor     | spectral graph-Laplacian fingerprint using bond-path distances                |
+
+  **3D types and conformers.** Conformers (5 per molecule, UFF-minimized,
+  lowest energy kept) are generated in parallel batches with a 10 s RDKit
+  embedding limit. A molecule RDKit cannot embed (rare — 5 of ~6,000 in
+  CHEMBL220, e.g. strained cages) is dropped with its target and listed in the
+  manifest (`dropped_no_conformer`) instead of aborting the run; without the
+  limit each such molecule took up to 22 min to fail. Conformers are cached on
+  the featurizer object, so further splits or 3D types on the same data reuse
+  them (~14 min for 6k molecules the first time, seconds after).
   | *(molecular graph)*| graph          | not an `fp_type` — `train_chemprop` builds the graph directly from `data.csv` (SMILES → atom/bond graph via chemprop) |
 
 - **Train** — pick one model per run (same `run_id`). Fingerprint/descriptor
@@ -283,7 +307,8 @@ that doubles as the Ollama tool schema.
 | `train_model`            | `model_type` (`random_forest`/`lightgbm`/`svr`/`gp`), `n_estimators` |
 | `grid_search`            | `model_type`, `param_grid` (dict; capped at 3 values/param, 6 combos total) |
 | `mlp_scan`               | `param_grid` (dict; capped at 3 values/param, 6 combos total), `cv_folds` (default 5) |
-| `dimension_reduction`    | `method` (`pca`/`tsne`), `color_by` (`target`/`split`/`classes`), `num_classes`, `remove_outliers` |
+| `dimension_reduction`    | `method` (`pca`/`tsne`), `color_by` (`target`/`split`/`classes`/`clusters`), `num_classes`, `remove_outliers` |
+| `cluster_molecules`      | `method` (`kmeans`/`hdbscan`), `n_clusters` (0 = auto), `max_clusters`, `min_cluster_size` (0 = auto) |
 | `evaluate_model`         | —                                                         |
 | `run_inference`          | `smiles_list`                                             |
 | `train_mlp`              | `epochs` (default 2500, the tuned value)                  |
@@ -456,6 +481,8 @@ configs (1-epoch CPU chemprop, short MLP runs) rather than excluded.
 | `test_grid_search.py`               | bounded-CV `grid_search`                                   |
 | `test_mlp_scan.py`                  | bounded-CV `mlp_scan`                                      |
 | `test_dimension_reduction.py`       | PCA / t-SNE EDA projection                                 |
+| `test_clustering.py`                | k-means / HDBSCAN on known blobs; `cluster_molecules` + cluster-colored plot |
+| `test_spectral_fp.py`               | spectral fingerprint invariances; `Spectral` / `Spectral_2D` pipeline round trips |
 | `test_multi_model.py`               | several model types on one run                             |
 | `test_classification_real_data.py`  | `prepare_classes` + RF / SVC / LightGBM grid / MLP / `mlp_scan` classifier round trips |
 | `test_chemprop.py`                  | chemprop regression **and** classifier: train → evaluate → inference |

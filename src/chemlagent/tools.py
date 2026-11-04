@@ -88,6 +88,7 @@ __all__ = [
     "train_chemprop",
     "run_inference_chemprop",
     "dimension_reduction",
+    "cluster_molecules",
     "mlp_scan",
 ]
 
@@ -534,13 +535,19 @@ def featurize_fingerprints(
             writes runs/<run_id>/features.npz, featurizer.pkl, manifest.json.
         fp_type: Fingerprint type. One of: ECFP (Morgan, default), Atom_Pair,
             Mordred, RDKit_2D, MACCS, PubChem, EState, Functional_Groups,
-            RDKitFingerprint, E3FP, Autocorr, MORSE, RDF. The last four are 3D
-            and require conformer generation (slower).
+            RDKitFingerprint, Spectral_2D, E3FP, Autocorr, MORSE, RDF,
+            Spectral. E3FP, Autocorr, MORSE, RDF and Spectral are 3D and
+            require conformer generation (slower: ~14 min for 6k molecules).
         test_size: Fraction of scaffolds held out for testing (default 0.2).
+
+    For 3D types, molecules RDKit cannot embed in 3D (rare; ~5 in 6,000 on
+    CHEMBL220, e.g. strained cages) are dropped with their targets, so n_train
+    + n_test can be slightly below the dataset size; they are listed in the
+    manifest under dropped_no_conformer.
 
     Returns:
         dict with keys: run_id, fp_type, features_path, featurizer_path,
-        n_train, n_test, n_features, is_3d.
+        n_train, n_test, n_features, is_3d, n_dropped_no_conformer.
     """
     print("Featurize fingerprints tool")
     print("=" * 55)
@@ -576,7 +583,13 @@ def featurize_fingerprints(
     )
 
     out = os.path.join(run_dir(run_id), _FEATURES)
-    np.savez(out, X_train=X_train, X_test=X_test, y_train=y_train, y_test=y_test)
+    # SMILES in split order (H stripped from 3D conformer mols) so row-level
+    # results such as cluster_molecules' assignments map back to molecules.
+    from rdkit import Chem
+    smiles_of = lambda mols: np.array([Chem.MolToSmiles(Chem.RemoveHs(m)) for m in mols])
+    np.savez(out, X_train=X_train, X_test=X_test, y_train=y_train, y_test=y_test,
+             smiles_train=smiles_of(gfp.mols_train),
+             smiles_test=smiles_of(gfp.mols_test))
 
     # Pickle a SMILES->features wrapper (not the raw skfp estimator) so the
     # inference tools can call .transform(smiles) directly.
@@ -603,6 +616,8 @@ def featurize_fingerprints(
         "task": task,
         "n_classes": int(len(np.unique(targets))) if task == "classification"
         else None,
+        "dropped_no_conformer": list(getattr(gfp, "dropped_no_conformer", [])),
+        "n_dropped_no_conformer": len(getattr(gfp, "dropped_no_conformer", [])),
     })
     _write_manifest(run_id, manifest)
     return manifest
@@ -2345,7 +2360,7 @@ def run_inference_chemprop(run_id: str, smiles_list: list[str],
 # high-feature/low-sample run degrades gracefully instead of crashing.
 
 _DR_METHODS = ("pca", "tsne")
-_DR_COLOR_BY = ("target", "split", "classes")
+_DR_COLOR_BY = ("target", "split", "classes", "clusters")
 
 
 def _elliptic_outliers(X, contamination):
@@ -2444,8 +2459,10 @@ def dimension_reduction(
         method: 'pca' (default) or 'tsne'.
         color_by: How to color points: 'target' (default, continuous color
             gradient by the target value with a colorbar), 'split' (train vs
-            test), or 'classes' (target binned into num_classes quantile
-            classes, like the EDA notebook's make_classes).
+            test), 'classes' (target binned into num_classes quantile
+            classes, like the EDA notebook's make_classes), or 'clusters'
+            (the latest cluster_molecules result for this run's fingerprint;
+            run cluster_molecules first).
         num_classes: Number of quantile classes when color_by='classes'
             (default 3). Ignored for other color_by values.
         remove_outliers: Drop multivariate outliers (EllipticEnvelope) before
@@ -2471,8 +2488,8 @@ def dimension_reduction(
     color_by = color_by.lower()
     if color_by not in _DR_COLOR_BY:
         raise ValueError(
-            f"Unknown color_by {color_by!r}. Use 'target', 'split', or "
-            f"'classes'.")
+            f"Unknown color_by {color_by!r}. Use 'target', 'split', "
+            f"'classes', or 'clusters'.")
 
     feat_path = os.path.join(run_dir(run_id), _FEATURES)
     if not os.path.exists(feat_path):
@@ -2485,6 +2502,19 @@ def dimension_reduction(
     n_train = int(feats["X_train"].shape[0])
     split = np.concatenate([np.zeros(n_train, dtype=int),
                             np.ones(len(y) - n_train, dtype=int)])
+    clusters = np.zeros(len(y), dtype=int)
+    if color_by == "clusters":
+        m = _read_manifest(run_id) if os.path.exists(_manifest_path(run_id)) else {}
+        cpath = m.get("latest_clusters", {}).get(m.get("fp_type") or "features")
+        if not cpath or not os.path.exists(cpath):
+            raise FileNotFoundError(
+                f"No clustering for run {run_id!r} with its current fp_type. "
+                f"Run cluster_molecules(run_id={run_id!r}) first.")
+        clusters = pd.read_csv(cpath)["cluster"].to_numpy()
+        if len(clusters) != len(y):
+            raise ValueError(
+                f"{cpath} has {len(clusters)} rows but features.npz has "
+                f"{len(y)}; re-run cluster_molecules after featurizing.")
 
     # Replace non-finite values (NaN/inf from some descriptor featurizers)
     # before scaling so StandardScaler / the projectors do not see them.
@@ -2497,7 +2527,8 @@ def dimension_reduction(
     if remove_outliers:
         inliers = _elliptic_outliers(X, outlier_contamination)
         n_outliers = int((~inliers).sum())
-        X, y, split = X[inliers], y[inliers], split[inliers]
+        X, y, split, clusters = (X[inliers], y[inliers], split[inliers],
+                                 clusters[inliers])
     if print_flag:
         print(f"Combined features: {X.shape}; removed {n_outliers} outliers.")
 
@@ -2558,6 +2589,19 @@ def dimension_reduction(
                         edgecolors="none", alpha=0.85)
         ax.legend(handles=sc.legend_elements()[0], labels=["train", "test"],
                   title="split")
+    elif color_by == "clusters":  # HDBSCAN noise (-1) drawn in light grey
+        noise = clusters < 0
+        if noise.any():
+            ax.scatter(Z[noise, 0], Z[noise, 1], c="#cccccc", s=12,
+                       edgecolors="none", label="noise")
+        ids = sorted(set(clusters[~noise]))
+        cmap = plt.get_cmap("tab20", max(len(ids), 1))
+        for i, c in enumerate(ids):
+            sel = clusters == c
+            ax.scatter(Z[sel, 0], Z[sel, 1], color=cmap(i), s=18,
+                       edgecolors="none", alpha=0.85, label=f"cluster {c}")
+        if len(ids) <= 20:
+            ax.legend(fontsize=7, markerscale=1.5, title="clusters")
     else:  # classes -- quantile-bin the continuous target
         nc = max(2, int(num_classes))
         qs = np.linspace(0, 1, nc + 1)
@@ -2626,3 +2670,120 @@ def dimension_reduction(
         "plot_path": plot_path,
         "manifest_path": manifest_path,
     }
+
+# --- EDA: clustering ---------------------------------------------------------
+#
+# cluster_molecules groups the featurized molecules (train + test combined,
+# unsupervised) with k-means or HDBSCAN via chemlagent.clustering, scores the
+# clusters against the target, and saves per-molecule assignments to CSV.
+# dimension_reduction(color_by='clusters') then colors a PCA/t-SNE plot by the
+# most recent clustering of the run's current fingerprint.
+
+def cluster_molecules(
+    run_id: str,
+    method: str = "kmeans",
+    n_clusters: int = 0,
+    max_clusters: int = 20,
+    min_cluster_size: int = 0,
+) -> dict:
+    """Cluster the featurized molecules and score how well clusters separate the target.
+
+    Reads runs/<run_id>/features.npz (call featurize_fingerprints first with
+    the SAME run_id), combines train + test (unsupervised -- the target is
+    never used to form clusters), standardizes the features and PCA-reduces
+    them (<= 50 PCA components for k-means, <= 10 for HDBSCAN), then clusters:
+      - 'kmeans' (default): with n_clusters=0 the number of clusters is chosen
+        automatically -- k = 2..max_clusters is scanned and the elbow of the
+        inertia curve is kept. Pass n_clusters > 0 to fix k.
+      - 'hdbscan': density-based; finds its own number of clusters and labels
+        molecules in low-density regions as noise (cluster -1). min_cluster_size
+        sets the smallest group it will call a cluster (0 = auto,
+        max(10, min(25, n/100))).
+        On continuous descriptors HDBSCAN can find no density gaps and return
+        one dominant cluster (n_clusters <= 2 with u_test_frac near 0); if
+        that happens, re-run with method='kmeans' instead of reporting it.
+
+    Cluster quality is reported in target space: u_test_frac is the fraction
+    of cluster pairs whose target distributions differ significantly
+    (Mann-Whitney U, p < 0.05; closer to 1 = clusters are chemically AND
+    property-wise distinct), dbi the Davies-Bouldin index (lower = better),
+    chi the Calinski-Harabasz index (higher = better), silhouette the feature-
+    space separation (-1..1, higher = better). Use it to find chemical series,
+    check whether a fingerprint groups molecules with similar activity, or
+    compare fingerprints (re-featurize the same run_id with another fp_type and
+    cluster again). Follow with dimension_reduction(color_by='clusters') to see
+    the clusters on a 2D plot.
+
+    Args:
+        run_id: Pipeline run identifier; reads features.npz, writes
+            runs/<run_id>/clusters_<method>_<fp_type>.csv and updates
+            manifest.json.
+        method: 'kmeans' (default) or 'hdbscan'.
+        n_clusters: k-means cluster count; 0 (default) = choose automatically
+            (inertia elbow). Ignored for hdbscan.
+        max_clusters: Largest k tried by the automatic k-means scan (default
+            20). Ignored for hdbscan or when n_clusters > 0.
+        min_cluster_size: HDBSCAN minimum cluster size; 0 (default) = auto.
+            Ignored for kmeans.
+
+    Returns:
+        dict with keys: run_id, method, fp_type, n_molecules, n_clusters,
+        n_noise, silhouette, u_test_frac, dbi, chi, k_scan (kmeans auto only:
+        inertia + silhouette per k),
+        clusters (up to the 25 largest: cluster, size, target_mean,
+        target_std), clusters_path, manifest_path.
+    """
+    print("Cluster molecules tool")
+    print("=" * 55)
+    from chemlagent.clustering import cluster_features, cluster_quality
+
+    method = method.lower()
+    feat_path = os.path.join(run_dir(run_id), _FEATURES)
+    if not os.path.exists(feat_path):
+        raise FileNotFoundError(
+            f"{feat_path} not found. Run featurize_fingerprints for run_id "
+            f"{run_id!r} first.")
+    feats = np.load(feat_path)
+    X = np.vstack([feats["X_train"], feats["X_test"]])
+    y = np.concatenate([feats["y_train"], feats["y_test"]]).astype(float)
+    n_train = int(feats["X_train"].shape[0])
+
+    labels, info = cluster_features(X, method=method, n_clusters=n_clusters,
+                                    max_clusters=max_clusters,
+                                    min_cluster_size=min_cluster_size)
+    quality = cluster_quality(y, labels)
+    if print_flag:
+        print(f"{info['n_clusters']} clusters ({info['n_noise']} noise) from "
+              f"{X.shape}; U-test frac={quality['u_test_frac']:.3f}")
+
+    manifest = _read_manifest(run_id) if os.path.exists(
+        _manifest_path(run_id)) else {}
+    fp_type = manifest.get("fp_type") or "features"
+    variant = f"{method}_{fp_type}"
+    table = pd.DataFrame({
+        "split": ["train"] * n_train + ["test"] * (len(y) - n_train),
+        "target": y, "cluster": labels})
+    if "smiles_train" in feats:  # runs featurized before SMILES were saved lack it
+        table.insert(0, "SMILES", np.concatenate([feats["smiles_train"],
+                                                  feats["smiles_test"]]))
+    clusters_path = os.path.join(run_dir(run_id), f"clusters_{variant}.csv")
+    table.to_csv(clusters_path, index=False)
+    publish_products(run_id, run_dir(run_id), os.path.basename(clusters_path),
+                     _MANIFEST)
+
+    result = {
+        "run_id": run_id, "method": method, "fp_type": fp_type,
+        "n_molecules": int(len(y)), "n_clusters": info["n_clusters"],
+        "n_noise": info["n_noise"], "silhouette": info["silhouette"],
+        "u_test_frac": quality["u_test_frac"], "dbi": quality["dbi"],
+        "chi": quality["chi"], "k_scan": info.get("k_scan"),
+        "clusters": quality["clusters"][:25], "clusters_path": clusters_path,
+    }
+    record = {k: v for k, v in result.items() if k not in ("run_id", "clusters")}
+    manifest.setdefault("clusters", {})[variant] = record
+    # dimension_reduction(color_by='clusters') colors by the latest clustering
+    # of the current fp_type.
+    manifest.setdefault("latest_clusters", {})[fp_type] = clusters_path
+    result["manifest_path"] = _write_manifest(run_id, manifest)
+    return result
+

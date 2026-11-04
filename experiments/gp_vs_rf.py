@@ -10,11 +10,15 @@ Splits:   SEEDS scaffold splits (80/20 by Murcko scaffold) per dataset.
 Metrics:  test R2 / RMSE / MAE; for the GP also 95%-interval coverage and the
           Spearman correlation between predicted std and |error|.
 
-Results append to experiments/results/gp_vs_rf.csv; finished (dataset, seed)
-pairs are skipped on re-run.
+Results append to experiments/results/gp_vs_rf.csv; finished
+(dataset, seed, features, model) rows are skipped on re-run, so adding a new
+featurizer only computes the new rows and reuses the existing baselines.
 
 Usage: .venv/bin/python experiments/gp_vs_rf.py
+       .venv/bin/python experiments/gp_vs_rf.py --features Spectral Spectral_2D
+           [--models RF GP] [--datasets azo CHEMBL220]
 """
+import argparse
 import os
 import time
 
@@ -33,25 +37,39 @@ DATASETS = {
 }
 SEEDS = (132, 7, 2024, 11, 99)
 OUT = "experiments/results/gp_vs_rf.csv"
-os.makedirs(os.path.dirname(OUT), exist_ok=True)
-done = (set(map(tuple, pd.read_csv(OUT)[["dataset", "seed"]].drop_duplicates().values))
-        if os.path.exists(OUT) else set())
+KEY = ["dataset", "seed", "features", "model"]
 
-for dname, (path, ycol) in DATASETS.items():
+ap = argparse.ArgumentParser()
+ap.add_argument("--features", nargs="+", default=["RDKit_2D", "ECFP"],
+                help="get_fingerprints fp_type values to compare")
+ap.add_argument("--models", nargs="+", default=["RF", "GP"], choices=["RF", "GP"])
+ap.add_argument("--datasets", nargs="+", default=list(DATASETS), choices=list(DATASETS))
+args = ap.parse_args()
+
+os.makedirs(os.path.dirname(OUT), exist_ok=True)
+done = (set(map(tuple, pd.read_csv(OUT)[KEY].values)) if os.path.exists(OUT) else set())
+
+for dname in args.datasets:
+    path, ycol = DATASETS[dname]
     df = pd.read_csv(path).dropna(subset=["SMILES", ycol])
+    # One featurizer object per dataset: 3D conformers are generated once and
+    # reused for every seed and every 3D fp_type (get_fingerprints caches them).
+    gfp = get_fingerprints(df["SMILES"].tolist(), df[ycol].to_numpy(float),
+                           transform_flag=False)
     for seed in SEEDS:
-        if (dname, seed) in done:
-            print(f"skip {dname} seed {seed} (done)")
-            continue
         rows = []
-        for fp in ("RDKit_2D", "ECFP"):
-            gfp = get_fingerprints(df["SMILES"].tolist(), df[ycol].to_numpy(float),
-                                   transform_flag=False)
+        for fp in args.features:
+            todo = [m for m in args.models if (dname, seed, fp, m) not in done]
+            if not todo:
+                print(f"skip {dname} seed {seed} {fp} (done)")
+                continue
+            t_feat = time.time()
             Xtr, Xte, ytr, yte = gfp.create(fp_type=fp, split_seed=seed)
             Xtr, Xte = np.asarray(Xtr, float), np.asarray(Xte, float)
             Xtr[~np.isfinite(Xtr)] = np.nan
             Xte[~np.isfinite(Xte)] = np.nan
-            for model in ("RF", "GP"):
+            t_feat = time.time() - t_feat
+            for model in todo:
                 t0 = time.time()
                 if model == "RF":
                     _, _, m = random_forest_regression(Xtr, ytr, Xte, yte,
@@ -69,13 +87,20 @@ for dname, (path, ycol) in DATASETS.items():
                     cov95=np.mean(err <= 1.96 * sd) if sd is not None else np.nan,
                     std_err_spearman=spearmanr(sd, err)[0] if sd is not None else np.nan,
                     kernel=str(m[-1].kernel_) if model == "GP" else "",
-                    seconds=time.time() - t0))
+                    seconds=time.time() - t0, featurize_seconds=t_feat))
                 print(f"{dname} s{seed} {fp:8s} {model}: R2={rows[-1]['r2']:.3f} "
                       f"RMSE={rows[-1]['rmse']:.3f} ({rows[-1]['seconds']:.0f}s)", flush=True)
-        pd.DataFrame(rows).to_csv(OUT, mode="a", header=not os.path.exists(OUT), index=False)
+        if rows:
+            new = pd.DataFrame(rows)
+            if os.path.exists(OUT):  # align columns (featurize_seconds added later)
+                new = pd.concat([pd.read_csv(OUT), new], ignore_index=True)
+            new.to_csv(OUT, index=False)
 
 r = pd.read_csv(OUT)
 pd.set_option("display.width", 200)
+print("\nMean test R2 over splits (features x model):")
+print(r.pivot_table(index=["dataset", "features"], columns="model", values="r2",
+                    aggfunc=["mean", "std"]).round(3).to_string())
 print("\nMean (sd) over splits:")
 print(r.groupby(["dataset", "features", "model"])[["r2", "rmse", "mae", "cov95",
                                                    "std_err_spearman"]]

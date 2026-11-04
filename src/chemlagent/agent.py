@@ -66,6 +66,7 @@ TOOLS = [
     T.train_chemprop,
     T.run_inference_chemprop,
     T.dimension_reduction,
+    T.cluster_molecules,
     T.mlp_scan,
     shell_mod.shell,
 ]
@@ -98,8 +99,10 @@ fetch from ChEMBL (the ID may come from step 0). Choose a run_id (e.g. the \
 target name or a short label). SMILES/target columns and whether to \
 log-transform the target are autodetected.
 2. featurize_fingerprints — featurize the dataset with a fingerprint type \
-(e.g. ECFP, Mordred, PubChem, MACCS) and scaffold-split it. Required before \
-train_model / train_mlp / dimension_reduction. Use the SAME run_id.
+(e.g. ECFP, Mordred, RDKit_2D, PubChem, MACCS; the 3D types E3FP, MORSE, \
+RDF, Autocorr and Spectral need conformers and are slower) and scaffold-split \
+it. Required before train_model / train_mlp / \
+dimension_reduction / cluster_molecules. Use the SAME run_id.
 2.5. prepare_classes — OPTIONAL classification switch: divides the target \
 into num_classes equal-count bands (classes 0..K-1 with range labels) and \
 turns the run into a CLASSIFICATION run. Call it after prepare_chembl_csv and \
@@ -153,6 +156,13 @@ re-coloring the same projection rewrites the same file (latest coloring \
 wins). Use it to eyeball whether the feature space separates potency \
 classes or clusters by scaffold, before or after training. No effect on the \
 model.
+7. cluster_molecules — optional EDA step after featurize_fingerprints (same \
+run_id). Groups the molecules by their features with k-means (number of \
+clusters picked automatically at the inertia elbow unless n_clusters is given) or \
+HDBSCAN (finds its own clusters, marks noise as -1), and reports how well the \
+clusters separate the target (u_test_frac, dbi, chi) plus per-cluster size and \
+mean target. Saves runs/<run_id>/clusters_<method>_<fp_type>.csv. Then \
+dimension_reduction(color_by='clusters') plots them. No effect on the model.
 
 Always reuse the same run_id across the stages of one task. Report metrics \
 (R^2, MAE) clearly to the user, and explain in plain terms what was built. \
