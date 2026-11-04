@@ -89,6 +89,7 @@ __all__ = [
     "run_inference_chemprop",
     "dimension_reduction",
     "cluster_molecules",
+    "compute_distances",
     "mlp_scan",
 ]
 
@@ -2787,3 +2788,129 @@ def cluster_molecules(
     result["manifest_path"] = _write_manifest(run_id, manifest)
     return result
 
+
+# --- similarity: molecular distances -----------------------------------------
+#
+# compute_distances wraps chemlagent.fingerprints.get_distances (ported from
+# CafChem's get_distances) for the agent: query SMILES vs reference SMILES, vs
+# the run's whole dataset (nearest training-like neighbours + their targets --
+# a quick applicability-domain check), or among themselves.
+
+def compute_distances(
+    run_id: str,
+    smiles_list: list[str],
+    distance_type: str = "tanimoto",
+    reference_smiles: list[str] | None = None,
+    against_dataset: bool = False,
+    top_k: int = 5,
+    fp_type: str = "ECFP",
+) -> dict:
+    """Measure how similar molecules are and find each molecule's nearest neighbours.
+
+    Computes a distance between every query SMILES and every reference SMILES
+    (0 = identical, 1 = nothing in common; similarity = 1 - distance) and
+    reports each query's top_k nearest references. References are, in order of
+    precedence: the run's prepared dataset (against_dataset=True -- reads
+    runs/<run_id>/data.csv, so neighbours come with their target values; use
+    this to check whether new molecules resemble the training data before
+    trusting a prediction), reference_smiles, or else the queries themselves
+    (pairwise; a molecule is not its own neighbour).
+
+    distance_type:
+      - 'tanimoto' (default): Tanimoto on the featurizer given by fp_type --
+        any fp_type featurize_fingerprints accepts (default ECFP: Morgan bits,
+        radius 2, 2048). Exact on bit fingerprints; the dot-product
+        generalization on counts; continuous descriptors (RDKit_2D, Mordred,
+        Spectral, ...) are min-max scaled per column over the molecules in
+        the call first. Fast for 2D types.
+      - 'mcs': maximum common substructure. Slow (~50 ms/pair).
+      - 'fraggle': Fraggle fragment similarity. Slow. It fragments the query:
+        a query with an acridine-type core (e.g. tacrine) cannot be scored
+        against anything -- those pairs get distance 1.0 and are counted in
+        n_failed_pairs (such molecules work fine as references).
+      - 'spectral': 3D spectral fingerprint (conformers; slower to featurize).
+      - 'spectral_2d': spectral fingerprint from bond paths. Fast.
+    mcs and fraggle are limited to 50,000 query x reference pairs.
+
+    Args:
+        run_id: Pipeline run identifier; results are written to
+            runs/<run_id>/distances_<distance_type>.csv (+ .npz full matrix).
+        smiles_list: Query SMILES.
+        distance_type: One of tanimoto, mcs, fraggle, spectral, spectral_2d
+            (default tanimoto).
+        reference_smiles: Optional reference SMILES to compare against.
+        against_dataset: Compare against the run's dataset (data.csv) instead;
+            requires prepare_chembl_csv to have been run for run_id.
+        top_k: Number of nearest neighbours reported per query (default 5).
+        fp_type: Featurizer for distance_type='tanimoto' (default ECFP);
+            ignored by the other distance types.
+
+    Returns:
+        dict with keys: run_id, distance_type, fp_type, reference ('dataset',
+        'reference_smiles' or 'pairwise'), n_queries, n_references,
+        mean_nearest_distance, n_failed_pairs (fraggle only, else 0),
+        neighbours (per query, up to 20 queries: query, nearest list of
+        {smiles, distance, similarity[, target]}), neighbours_path,
+        matrix_path.
+    """
+    print("Compute distances tool")
+    print("=" * 55)
+    from chemlagent.fingerprints import clean_smiles, get_distances
+
+    ref_targets = None
+    if against_dataset:
+        data_csv = os.path.join(run_dir(run_id), "data.csv")
+        if not os.path.exists(data_csv):
+            raise FileNotFoundError(
+                f"{data_csv} not found. Run prepare_chembl_csv for run_id "
+                f"{run_id!r} first, or pass reference_smiles instead.")
+        df = pd.read_csv(data_csv)
+        refs, ref_targets, mode = df["SMILES"].tolist(), df["target"].to_numpy(), "dataset"
+    elif reference_smiles:
+        refs, mode = list(reference_smiles), "reference_smiles"
+    else:
+        refs, mode = None, "pairwise"
+
+    D = get_distances(smiles_list, refs, distance_type=distance_type,
+                      fraggle_fail_value=np.nan, fp_type=fp_type)
+    n_failed = int(np.isnan(D).sum())  # only Fraggle produces NaN
+    D = np.nan_to_num(D, nan=1.0)
+    if mode == "pairwise":
+        D_nn = D + np.diag(np.full(len(D), np.inf))  # not your own neighbour
+        ref_list = clean_smiles(smiles_list)
+    else:
+        D_nn, ref_list = D, clean_smiles(refs)
+
+    k = max(1, min(int(top_k), D_nn.shape[1] - (mode == "pairwise")))
+    order = np.argsort(D_nn, axis=1)[:, :k]
+    rows, neighbours = [], []
+    for qi, q in enumerate(clean_smiles(smiles_list)):
+        near = []
+        for rank, j in enumerate(order[qi], start=1):
+            rec = {"smiles": ref_list[j], "distance": float(D[qi, j]),
+                   "similarity": float(1 - D[qi, j])}
+            if ref_targets is not None:
+                rec["target"] = float(ref_targets[j])
+            near.append(rec)
+            rows.append({"query": q, "rank": rank, **rec})
+        neighbours.append({"query": q, "nearest": near})
+
+    t = distance_type.lower()
+    neighbours_path = os.path.join(run_dir(run_id), f"distances_{t}.csv")
+    matrix_path = os.path.join(run_dir(run_id), f"distances_{t}.npz")
+    pd.DataFrame(rows).to_csv(neighbours_path, index=False)
+    np.savez(matrix_path, distances=D, query_smiles=np.array(clean_smiles(smiles_list)),
+             reference_smiles=np.array(ref_list))
+    publish_products(run_id, run_dir(run_id), os.path.basename(neighbours_path))
+    if print_flag:
+        print(f"{D.shape[0]} x {D.shape[1]} {t} distances; {n_failed} failed pairs.")
+
+    return {
+        "run_id": run_id, "distance_type": t,
+        "fp_type": fp_type if t == "tanimoto" else None, "reference": mode,
+        "n_queries": int(D.shape[0]), "n_references": int(D.shape[1]),
+        "mean_nearest_distance": float(np.mean(D_nn[np.arange(len(D)), order[:, 0]])),
+        "n_failed_pairs": n_failed,
+        "neighbours": neighbours[:20],
+        "neighbours_path": neighbours_path, "matrix_path": matrix_path,
+    }

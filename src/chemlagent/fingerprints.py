@@ -201,6 +201,115 @@ def _embed_or_none(gen, mol):
     return None
 
 
+# --- molecular distances ----------------------------------------------------
+# Ported from CafChem's CafChemSKFP.get_fingerprints.get_distance_types /
+# get_distances (skfp Fraggle + MCS distances), as a standalone function so it
+# needs no targets, and extended with fast fingerprint distances and the
+# spectral fingerprint. Every distance is in [0, 1] (0 = identical); the
+# matching similarity is 1 - distance.
+DISTANCE_TYPES = {
+    'tanimoto': 'Tanimoto on any get_fingerprints fp_type (default ECFP: Morgan bits, radius 2, 2048) -- '
+                'exact on bits, the dot-product generalization on counts; continuous '
+                'descriptors are min-max scaled per column first',
+    'mcs': 'maximum common substructure (1 - MCS similarity) -- slow (~50 ms/pair)',
+    'fraggle': 'Fraggle fragment similarity -- slow (~60 ms/pair); a query with an '
+               'acridine-type core (e.g. tacrine) cannot be scored: those pairs get 1.0',
+    'spectral': 'spectral fingerprint from 3D conformers (Toney et al. 2026), d = e/(1+e) of Euclidean e',
+    'spectral_2d': 'spectral fingerprint from bond-path distances, d = e/(1+e) of Euclidean e',
+}
+SLOW_DISTANCES = ('mcs', 'fraggle')
+MAX_SLOW_PAIRS = 50_000   # ~5 min on 6 cores for MCS/Fraggle
+MCS_TIMEOUT = 10          # s per pair (skfp default is 3600)
+
+
+def get_distance_types():
+  """Distance types accepted by get_distances, with one-line descriptions."""
+  return dict(DISTANCE_TYPES)
+
+
+def _fraggle_row(q, refs, fail_value=1.0):
+  from skfp.distances import fraggle_distance
+  row = []
+  for r in refs:
+    try:
+      row.append(fraggle_distance(q, r))
+    except Exception:  # skfp/RDKit fail on ~30% of drug-like pairs (None
+      row.append(fail_value)  # fragment), incl. fused cores such as tacrine
+  return row
+
+
+def _mcs_row(q, refs):
+  from skfp.distances import bulk_mcs_distance
+  return bulk_mcs_distance([q], refs, timeout=MCS_TIMEOUT)[0]
+
+
+def get_distances(smiles_list, reference_smiles=None, distance_type='tanimoto',
+                  n_jobs=-1, fraggle_fail_value=1.0, fp_type='ECFP'):
+  """Distance matrix (len(smiles_list) x len(reference_smiles)); reference
+  defaults to smiles_list itself (square, zero diagonal). SMILES are salt-
+  stripped with clean_smiles first. See DISTANCE_TYPES for the options.
+  fraggle_fail_value is used for pairs Fraggle cannot score (pass np.nan to
+  identify them). fp_type picks the featurizer for 'tanimoto' (any key of
+  get_fingerprints.fp_hash); it is ignored by the other distance types."""
+  distance_type = distance_type.lower()
+  if distance_type not in DISTANCE_TYPES:
+    raise ValueError(f"Unknown distance_type {distance_type!r}. Use one of "
+                     f"{list(DISTANCE_TYPES)}.")
+  query = clean_smiles(smiles_list)
+  ref = query if reference_smiles is None else clean_smiles(reference_smiles)
+  n_pairs = len(query) * len(ref)
+  if distance_type in SLOW_DISTANCES and n_pairs > MAX_SLOW_PAIRS:
+    raise ValueError(
+        f"{distance_type} on {n_pairs} pairs would take too long (limit "
+        f"{MAX_SLOW_PAIRS}). Use fewer molecules or a fast distance "
+        f"('tanimoto', 'spectral_2d').")
+  to_mols = MolFromSmilesTransformer().transform
+
+  if distance_type == 'tanimoto':
+    from chemlagent.models import TanimotoKernel
+    gfp = get_fingerprints([], [], transform_flag=False, n_jobs=n_jobs)  # for fp_hash
+    if fp_type not in gfp.fp_hash:
+      raise ValueError(f"Unknown fp_type {fp_type!r}. Use one of {list(gfp.fp_hash)}.")
+    feat = SmilesFeaturizer(gfp.fp_hash[fp_type][0], is_3d=fp_type in gfp.types_3d,
+                            n_jobs=n_jobs)
+    from chemlagent.models import _looks_like_fingerprint
+    Xq = np.nan_to_num(np.asarray(feat.transform(query), dtype=float))  # NaN -> 0 (Mordred)
+    Xr = Xq if reference_smiles is None else np.nan_to_num(
+        np.asarray(feat.transform(ref), dtype=float))
+    both = np.vstack([Xq, Xr])
+    if not _looks_like_fingerprint(both):
+      # Continuous descriptors: min-max scale each column to [0, 1] over all
+      # molecules in this call, so large-valued columns do not dominate and
+      # negative values cannot push the distance outside [0, 1]. Constant
+      # columns become 0. Bit/count fingerprints are used as they are.
+      lo, span = both.min(axis=0), np.ptp(both, axis=0)
+      span[span == 0] = np.inf
+      Xq, Xr = (Xq - lo) / span, (Xr - lo) / span
+    return np.clip(1.0 - TanimotoKernel()(Xq, Xr), 0.0, 1.0)
+
+  if distance_type in SLOW_DISTANCES:
+    mq = to_mols(query)
+    mr = mq if reference_smiles is None else to_mols(ref)
+    if distance_type == 'mcs':
+      rows = (delayed(_mcs_row)(q, mr) for q in mq)
+    else:
+      rows = (delayed(_fraggle_row)(q, mr, fraggle_fail_value) for q in mq)
+    D = np.array(Parallel(n_jobs=n_jobs)(rows), dtype=float)
+    if reference_smiles is None:
+      np.fill_diagonal(D, 0.0)
+    return D
+
+  # spectral / spectral_2d -- same featurizer path as inference
+  is_3d = distance_type == 'spectral'
+  feat = SmilesFeaturizer(SpectralFingerprint(use_3D=is_3d), is_3d=is_3d,
+                          n_jobs=n_jobs)
+  Xq = feat.transform(query)
+  Xr = Xq if reference_smiles is None else feat.transform(ref)
+  from scipy.spatial.distance import cdist
+  e = cdist(Xq, Xr)
+  return e / (1.0 + e)
+
+
 def _embed_chunk(gen, mols):
   '''Batch-embed a chunk. skfp aborts the batch at the first molecule it
   cannot embed and names it in the error; that molecule becomes None (it is

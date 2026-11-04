@@ -67,6 +67,7 @@ TOOLS = [
     T.run_inference_chemprop,
     T.dimension_reduction,
     T.cluster_molecules,
+    T.compute_distances,
     T.mlp_scan,
     shell_mod.shell,
 ]
@@ -163,6 +164,14 @@ HDBSCAN (finds its own clusters, marks noise as -1), and reports how well the \
 clusters separate the target (u_test_frac, dbi, chi) plus per-cluster size and \
 mean target. Saves runs/<run_id>/clusters_<method>_<fp_type>.csv. Then \
 dimension_reduction(color_by='clusters') plots them. No effect on the model.
+8. compute_distances — molecular similarity, available any time. Distances \
+(0 = identical, 1 = unrelated) from query SMILES to reference_smiles, to the \
+run's whole dataset (against_dataset=True, after prepare_chembl_csv; returns \
+each query's nearest dataset molecules with their target values -- use it to \
+check whether a molecule resembles the training data before trusting a \
+prediction), or among the queries. distance_type: tanimoto (default, fast; \
+fp_type picks its featurizer, default ECFP), spectral_2d, spectral, or the \
+slow substructure measures mcs / fraggle (max 50,000 pairs).
 
 Always reuse the same run_id across the stages of one task. Report metrics \
 (R^2, MAE) clearly to the user, and explain in plain terms what was built. \

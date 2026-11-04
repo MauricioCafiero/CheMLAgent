@@ -45,6 +45,9 @@ featurize_fingerprints  ──►  dimension_reduction   (optional EDA)
                          ──►  cluster_molecules     (optional EDA)
                               (k-means auto-k / HDBSCAN;
                                cluster quality vs target)
+
+compute_distances  (any time; similarity / nearest neighbours,
+                    optionally against the run's dataset)
 ```
 
 The discovery tools are optional — use them when the request gives a protein
@@ -116,6 +119,28 @@ currently inactive — see [CheMeleon foundation model](#chemeleon-foundation-mo
   indices on the target, plus feature-space silhouette. Writes
   `clusters_<method>_<fp_type>.csv` (SMILES, split, target, cluster); then
   `dimension_reduction(color_by='clusters')` plots them.
+- **Similarity / distances** — `compute_distances` gives distances in [0, 1]
+  (similarity = 1 − distance) from query SMILES to `reference_smiles`, to the
+  run's whole dataset (`against_dataset=True`: each query's nearest dataset
+  molecules with their targets — a quick applicability-domain check before
+  trusting a prediction), or among the queries. Ported from CafChem's
+  `get_distances` (`fingerprints.get_distances`) and extended:
+
+  | `distance_type` | measure | cost |
+  |-----------------|---------|------|
+  | `tanimoto` (default) | Tanimoto on any `fp_type` (`fp_type=`, default `ECFP`: Morgan bits, r = 2, 2048); continuous descriptors min-max scaled per column over the molecules compared | fast (2D types) |
+  | `spectral_2d`   | spectral fingerprint (bond paths), e/(1+e) of Euclidean e | fast |
+  | `spectral`      | spectral fingerprint (3D conformers) | conformer generation |
+  | `mcs`           | 1 − maximum-common-substructure similarity (10 s/pair timeout) | ~50 ms/pair, ≤ 50k pairs |
+  | `fraggle`       | 1 − Fraggle similarity | ~60 ms/pair, ≤ 50k pairs |
+
+  Fraggle (skfp/RDKit) fragments the *query* molecule and cannot score any
+  pair whose query has an acridine-type core (three linearly fused
+  six-membered rings around a ring N — acridine, tacrine and its hybrids;
+  ~14% of CHEMBL220, none of azo), even against itself; such references are
+  scored normally. Failed pairs get distance 1.0 and are counted in
+  `n_failed_pairs`. Other fused systems (naphthalene, indole, quinoline,
+  carbazole, steroids) score normally.
 
   The `fp_type` values accepted by `featurize_fingerprints` (and thus by
   `dimension_reduction`):
@@ -309,6 +334,7 @@ that doubles as the Ollama tool schema.
 | `mlp_scan`               | `param_grid` (dict; capped at 3 values/param, 6 combos total), `cv_folds` (default 5) |
 | `dimension_reduction`    | `method` (`pca`/`tsne`), `color_by` (`target`/`split`/`classes`/`clusters`), `num_classes`, `remove_outliers` |
 | `cluster_molecules`      | `method` (`kmeans`/`hdbscan`), `n_clusters` (0 = auto), `max_clusters`, `min_cluster_size` (0 = auto) |
+| `compute_distances`      | `smiles_list`, `distance_type`, `fp_type` (tanimoto), `reference_smiles`, `against_dataset`, `top_k` |
 | `evaluate_model`         | —                                                         |
 | `run_inference`          | `smiles_list`                                             |
 | `train_mlp`              | `epochs` (default 2500, the tuned value)                  |
@@ -482,6 +508,7 @@ configs (1-epoch CPU chemprop, short MLP runs) rather than excluded.
 | `test_mlp_scan.py`                  | bounded-CV `mlp_scan`                                      |
 | `test_dimension_reduction.py`       | PCA / t-SNE EDA projection                                 |
 | `test_clustering.py`                | k-means / HDBSCAN on known blobs; `cluster_molecules` + cluster-colored plot |
+| `test_distances.py`                 | all distance types, tanimoto across fp_types; Fraggle failure handling; `compute_distances` modes |
 | `test_spectral_fp.py`               | spectral fingerprint invariances; `Spectral` / `Spectral_2D` pipeline round trips |
 | `test_multi_model.py`               | several model types on one run                             |
 | `test_classification_real_data.py`  | `prepare_classes` + RF / SVC / LightGBM grid / MLP / `mlp_scan` classifier round trips |

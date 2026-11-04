@@ -18,6 +18,8 @@ This agent will:
 - train models and evaluate
 - save models (.pt files, or perhaps pickle for sklearn models)
 - run inference on a saved model
+- cluster featurized molecules (k-means / HDBSCAN) and score clusters against the target
+- compute molecular distances / nearest neighbours (Tanimoto on any featurizer, MCS, Fraggle, spectral)
 
 There are functions and classes for most of this already in src/
 
